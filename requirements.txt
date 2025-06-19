@@ -1,0 +1,17 @@
+debugpy==1.8.14
+albumentations==2.0.8
+numpy==2.2.6
+imutils==0.5.4
+pillow==11.2.1
+opencv-python==4.11.0.86
+segmentation_models_pytorch==0.5.0
+scipy==1.15.3
+torch==2.7.1
+torchvision==0.22.1
+tqdm==4.67.1
+matplotlib==3.10.3
+pandas==2.3.0
+scikit-learn==1.7.0
+pycocotools==2.0.10
+ultralytics==8.3.154
+reportlab==4.4.1
