@@ -30,7 +30,7 @@ OUTPUT_IMAGES_FOLDER = 'dataset/inference/images'
 
 # Model parameters
 NUM_CLASSES = 3
-IMG_SIZE = 1024
+IMG_SIZE = 1408
 CONFIDENCE_THRESHOLD = 0.3
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
