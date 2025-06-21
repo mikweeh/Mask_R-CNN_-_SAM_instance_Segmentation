@@ -79,6 +79,7 @@ DICE_WEIGHT = 0.0
 USE_FOCAL_DICE = False
 OVERSAMPLE_SMALL_OBJECTS = True
 USE_COPY_PASTE = True
+MASK_RESOLUTION = 56  # Only 28, 56 or 112
 
 # RPN parameters optimized for small objects
 RPN_PRE_NMS_TOP_N_TRAIN = 1500
@@ -564,32 +565,114 @@ def get_anchor_sizes(img_size, base_img_size=1280, base_min_anchor=16):
     anchor_sizes = tuple(min_anchor * (2**i) for i in range(5))
     return anchor_sizes
 
-def get_model_instance_segmentation(num_classes):
+def get_model_instance_segmentation(num_classes, mask_resolution=28):
     """
-    Creates Mask R-CNN model with optimized configuration for small objects.
+    Creates Mask R-CNN model with customizable mask resolution for small objects.
+    
+    Args:
+        num_classes: Number of classes including background
+        mask_resolution: Final mask output resolution.
+                        Common values: 28 (default), 56, 112
+    
+    Returns:
+        Enhanced Mask R-CNN model with higher resolution masks
     """
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
-
     
-    # Optimize anchor generator for small objects with proper FPN configuration
+    # Calculate ROI pooling size (typically half of final mask resolution)
+    roi_pool_size = mask_resolution // 2
+    
+    # Increase ROI pooling resolution for masks
+    model.roi_heads.mask_roi_pool.output_size = (roi_pool_size, roi_pool_size)
+    print(f"Mask ROI pool size set to: {roi_pool_size}×{roi_pool_size}")
+    print(f"Target mask resolution: {mask_resolution}×{mask_resolution}")
+    
+    # Create custom mask predictor for higher resolution
+    class HighResMaskRCNNPredictor(nn.Module):
+        def __init__(self, in_channels, dim_reduced, num_classes, mask_size):
+            super().__init__()
+            self.mask_size = mask_size
+            
+            # Determine number of conv layers based on resolution
+            if mask_size <= 28:
+                # Standard configuration for 28×28
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                
+            elif mask_size <= 56:
+                # Enhanced configuration for 56×56
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.conv6_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                
+            elif mask_size <= 112:
+                # Advanced configuration for 112×112
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.conv6_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.conv7_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu3 = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                
+            else:
+                raise ValueError(f"Mask resolution {mask_size} not supported. Use 28, 56, or 112.")
+            
+            # Initialize weights
+            for name, param in self.named_parameters():
+                if "weight" in name:
+                    nn.init.kaiming_normal_(param, mode="fan_out", nonlinearity="relu")
+                elif "bias" in name:
+                    nn.init.constant_(param, 0)
+        
+        def forward(self, x):
+            if self.mask_size <= 28:
+                x = self.conv5_mask(x)
+                x = self.relu(x)
+                x = self.mask_fcn_logits(x)
+                
+            elif self.mask_size <= 56:
+                x = self.conv5_mask(x)
+                x = self.relu1(x)
+                x = self.conv6_mask(x)
+                x = self.relu2(x)
+                x = self.mask_fcn_logits(x)
+                
+            elif self.mask_size <= 112:
+                x = self.conv5_mask(x)
+                x = self.relu1(x)
+                x = self.conv6_mask(x)
+                x = self.relu2(x)
+                x = self.conv7_mask(x)
+                x = self.relu3(x)
+                x = self.mask_fcn_logits(x)
+            
+            return x
+    
+    # Optimize anchor generator for small objects
     anchor_generator = torchvision.models.detection.anchor_utils.AnchorGenerator(
-        sizes=get_anchor_sizes(IMG_SIZE),  # 5 tuples, one for each feature map
+        sizes=tuple((size,) for size in get_anchor_sizes(IMG_SIZE)),
         aspect_ratios=((0.5, 1.0, 2.0),) * 5  # 5 tuples for 5 feature maps
     )
-    
     model.rpn.anchor_generator = anchor_generator
     
-    # Replace predictors
+    # Replace box predictor
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     
+    # Replace mask predictor with high-resolution version
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(
-        in_features_mask, hidden_layer, num_classes
+    model.roi_heads.mask_predictor = HighResMaskRCNNPredictor(
+        in_features_mask, hidden_layer, num_classes, mask_resolution
     )
     
+    print(f"Model configured for {mask_resolution}×{mask_resolution} masks")
     return model
+
 
 # =============================================================================
 # ENHANCED TRAINING WITH WEIGHTED LOSSES
@@ -1366,7 +1449,7 @@ def main():
 
     # Create enhanced model
     print("Initializing enhanced Mask R-CNN model...")
-    model = get_model_instance_segmentation(NUM_CLASSES)
+    model = get_model_instance_segmentation(NUM_CLASSES, MASK_RESOLUTION)
     model.to(DEVICE)
 
     # Enhanced optimizer and scheduler setup
