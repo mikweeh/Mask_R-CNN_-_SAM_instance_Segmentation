@@ -68,15 +68,15 @@ VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH, "_annotations_filtered.coco.json
 # Enhanced training parameters for small objects
 NUM_CLASSES = 3
 BATCH_SIZE = 1
-NUM_EPOCHS = 200
+NUM_EPOCHS = 180
 LEARNING_RATE = 0.0001
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Enhanced model parameters for small objects
 IMG_SIZE = 2048
 CONFIDENCE_THRESHOLD = 0.3
-DICE_WEIGHT = 5.0
-USE_FOCAL_DICE = True
+DICE_WEIGHT = 0.0
+USE_FOCAL_DICE = False
 OVERSAMPLE_SMALL_OBJECTS = True
 USE_COPY_PASTE = True
 
@@ -569,6 +569,7 @@ def get_model_instance_segmentation(num_classes):
     Creates Mask R-CNN model with optimized configuration for small objects.
     """
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
+
     
     # Optimize anchor generator for small objects with proper FPN configuration
     anchor_generator = torchvision.models.detection.anchor_utils.AnchorGenerator(
@@ -682,7 +683,7 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
                     matched_dice_losses = []
                     
                     for pred_idx, target_idx in matches:
-                        pred_mask = pred_masks[pred_idx:pred_idx+1]  # Keep batch dim
+                        pred_mask = pred_masks[pred_idx:pred_idx+1]
                         target_mask = target_masks[target_idx:target_idx+1]
                         
                         if use_focal_dice:
@@ -949,12 +950,12 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
     # Process each mask with proper None checking
     for i in range(len(masks)):
         try:
-            # FIXED: Check if mask exists and is not None
+            # Check if mask exists and is not None
             if masks[i] is None:
                 print(f"Mask {i} is None, skipping")
                 continue
             
-            # FIXED: Safely extract mask data
+            # Safely extract mask data
             mask_data = masks[i]
             
             # Handle different mask dimensions
@@ -1006,12 +1007,12 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
             # Apply transparency only where mask exists
             mask_area = binary_mask == 1
             
-            # FIXED: Check if mask_area has any True values before applying
+            # Check if mask_area has any True values before applying
             if not np.any(mask_area):
                 print(f"Mask area {i} is empty, skipping")
                 continue
             
-            # FIXED: Ensure we have valid arrays for cv2.addWeighted
+            # Ensure we have valid arrays for cv2.addWeighted
             try:
                 if result_image[mask_area].size > 0 and colored_mask[mask_area].size > 0:
                     result_image[mask_area] = cv2.addWeighted(
@@ -1037,6 +1038,7 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
 def get_next_model_name(base_name, weights_dir='weights'):
     """
     Get the next available model name with correlative numbering.
+    Returns the full path.
     """
     import os
     
@@ -1047,7 +1049,7 @@ def get_next_model_name(base_name, weights_dir='weights'):
     
     # If base name doesn't exist, use it
     if not os.path.exists(base_path):
-        return os.path.join(weights_dir, f"{base_name}.pth")
+        return base_path
     
     # Find next available number
     counter = 1
@@ -1076,7 +1078,7 @@ def save_inference_examples(model, train_dataset, val_dataset, output_path):
         
         processed_paths = []
         
-        # Process ALL test images
+        # Process all test images
         for idx, image_file in enumerate(test_image_files):
             test_image_path = os.path.join(TEST_IMAGES_PATH, image_file)
             print(f"Processing test image {idx+1}/{len(test_image_files)}: {test_image_path}")
@@ -1126,7 +1128,8 @@ def generate_training_report(train_losses, val_losses, val_dice_scores,
     
     # Generate report filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_filename = f"mask_rcnn_training_report_{timestamp}.pdf"
+    report_filename = (f"{timestamp}__"
+        f"{os.path.basename(MODEL_NAME).split('.')[0]}.pdf")
     report_path = os.path.join(REPORT_OUTPUT_PATH, report_filename)
     
     # Create PDF document
@@ -1186,13 +1189,13 @@ def generate_training_report(train_losses, val_losses, val_dice_scores,
             if (name.isupper() and 
                 not name.startswith('_') and 
                 not callable(value) and
-                not isinstance(value, types.ModuleType) and  # Exclude modules
-                name not in ['REPORTLAB_AVAILABLE', 'A4', 'TA_CENTER', 'TA_LEFT']):  # Exclude non-config globals
+                not isinstance(value, types.ModuleType) and
+                name not in ['REPORTLAB_AVAILABLE', 'A4', 'TA_CENTER', 'TA_LEFT']):
                 
                 # Convert complex objects to readable strings
                 if isinstance(value, (dict, list, tuple)):
                     config_vars[name] = str(value)
-                elif hasattr(value, '__name__'):  # For objects like torch.device
+                elif hasattr(value, '__name__'):
                     config_vars[name] = str(value)
                 else:
                     config_vars[name] = str(value)
@@ -1285,10 +1288,6 @@ def generate_training_report(train_losses, val_losses, val_dice_scores,
         if test_image_path and os.path.exists(test_image_path):
             story.append(RLImage(test_image_path, width=6*inch, height=4*inch))
         story.append(Spacer(1, 20))
-        
-        # Add page break every 2 images, but not after the last image
-        # if (idx + 1) % 2 == 0 and (idx + 1) < len(test_image_paths):
-        #     story.append(PageBreak())
 
     
     # Build PDF
@@ -1309,6 +1308,11 @@ def main():
     
     print(f"Using device: {DEVICE}")
     print(f"Training started at: {training_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    global MODEL_NAME
+
+    # Initialize MODEL_NAME with the actual path to use
+    MODEL_NAME = get_next_model_name(MODEL_NAME)
 
     # Create output directories
     os.makedirs(REPORT_OUTPUT_PATH, exist_ok=True)
@@ -1439,9 +1443,8 @@ def main():
         # Save best model
         if (not val_dice_scores[:-1] or 
             val_dice_scores[-1] > max(val_dice_scores[:-1])):
-            model_save_path = get_next_model_name(MODEL_NAME)
-            torch.save(model.state_dict(), model_save_path)
-            print(f"Model saved as: {model_save_path}")
+            torch.save(model.state_dict(), MODEL_NAME)
+            print(f"Model saved as: {MODEL_NAME}")
             clear_gpu_memory()
 
     # Record training end time
@@ -1450,7 +1453,7 @@ def main():
 
     # Final evaluation
     print("\n=== FINAL EVALUATION ===")
-    model.load_state_dict(torch.load('best_mask_rcnn_model.pth'))
+    model.load_state_dict(torch.load(MODEL_NAME))
     final_dice = evaluate_model(model, val_loader, DEVICE)
     print(f"Final Dice coefficient on validation: {final_dice:.4f}")
 
