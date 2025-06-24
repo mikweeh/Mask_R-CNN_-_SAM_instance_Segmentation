@@ -6,6 +6,7 @@ This script makes inference of Mask R-CNN and transforms the resulting
 inferenced masks into YoloV11 format.
 """
 
+import argparse
 import os
 import torch
 import torchvision
@@ -19,65 +20,153 @@ from PIL import Image
 import json
 
 # =============================================================================
-# CONFIGURATION VARIABLES
+# DEFAULT GLOBAL CONFIGURATION VARIABLES
 # =============================================================================
 
 # Paths and files
-MODEL_PATH = 'best_mask_rcnn_model.pth'
+MODEL_PATH = 'weights/MaskRCNN_5.pth'
 INPUT_IMAGES_FOLDER = 'dataset/test'
 OUTPUT_LABELS_FOLDER = 'dataset/inference/labels'
 OUTPUT_IMAGES_FOLDER = 'dataset/inference/images'
 
 # Model parameters
 NUM_CLASSES = 3
-IMG_SIZE = 1408
+IMG_SIZE = 2048
 CONFIDENCE_THRESHOLD = 0.3
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+MASK_RESOLUTION = 56
+BASE_MIN_ANCHOR = 16
 
-# Class mapping
-CLASS_MAPPING = {
-    1: 0,
-    2: 1,
-}
+# Default class mapping - can be overridden by arguments from main.py
+CLASS_MAPPING = {1: 0, 2: 1}  # Default: COCO class IDs to YOLO class IDs
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Convert Mask R-CNN predictions to YOLOv11 format'
+    )
+    
+    # Path arguments
+    parser.add_argument('--model_path', type=str, default=MODEL_PATH,
+                       help='Path to the trained model weights')
+    parser.add_argument('--input_images_folder', type=str, 
+                       default=INPUT_IMAGES_FOLDER,
+                       help='Folder containing input images')
+    parser.add_argument('--output_labels_folder', type=str, 
+                       default=OUTPUT_LABELS_FOLDER,
+                       help='Folder to save YOLO format labels')
+    parser.add_argument('--output_images_folder', type=str, 
+                       default=OUTPUT_IMAGES_FOLDER,
+                       help='Folder to save visualization images')
+    
+    # Model parameters
+    parser.add_argument('--num_classes', type=int, default=NUM_CLASSES,
+                       help='Number of classes (including background)')
+    parser.add_argument('--img_size', type=int, default=IMG_SIZE,
+                       help='Image size for inference')
+    parser.add_argument('--confidence_threshold', type=float, 
+                       default=CONFIDENCE_THRESHOLD,
+                       help='Confidence threshold for predictions')
+    parser.add_argument('--mask_resolution', type=int, 
+                       default=MASK_RESOLUTION,
+                       help='Mask resolution (28, 56, or 112)')
+    parser.add_argument('--base_min_anchor', type=int, 
+                       default=BASE_MIN_ANCHOR,
+                       help='Base minimum anchor size')
+    
+    # Class configuration argument (optional - will override default if provided)
+    parser.add_argument('--class_mapping', type=str, default=None,
+                       help='JSON string with COCO to YOLO class mapping')
+    
+    return parser.parse_args()
+
+def update_global_variables(args):
+    """Update global variables with command-line arguments."""
+    global MODEL_PATH, INPUT_IMAGES_FOLDER, OUTPUT_LABELS_FOLDER
+    global OUTPUT_IMAGES_FOLDER, NUM_CLASSES, IMG_SIZE, CONFIDENCE_THRESHOLD
+    global MASK_RESOLUTION, BASE_MIN_ANCHOR, CLASS_MAPPING
+    
+    # Update standard global variables
+    MODEL_PATH = args.model_path
+    INPUT_IMAGES_FOLDER = args.input_images_folder
+    OUTPUT_LABELS_FOLDER = args.output_labels_folder
+    OUTPUT_IMAGES_FOLDER = args.output_images_folder
+    NUM_CLASSES = args.num_classes
+    IMG_SIZE = args.img_size
+    CONFIDENCE_THRESHOLD = args.confidence_threshold
+    MASK_RESOLUTION = args.mask_resolution
+    BASE_MIN_ANCHOR = args.base_min_anchor
+    
+    # Update class configuration ONLY if provided as argument
+    if args.class_mapping is not None:
+        CLASS_MAPPING = json.loads(args.class_mapping)
+        # Convert string keys to integers (JSON converts int keys to strings)
+        CLASS_MAPPING = {int(k): v for k, v in CLASS_MAPPING.items()}
+        print(f"Updated CLASS_MAPPING from arguments: {CLASS_MAPPING}")
+    else:
+        print(f"Using default CLASS_MAPPING: {CLASS_MAPPING}")
 
 # =============================================================================
 # AUXILIARY FUNCTIONS
 # =============================================================================
 
-def get_model_instance_segmentation(num_classes):
+def get_anchor_sizes(img_size, base_img_size=1280, base_min_anchor=16):
     """
-    Creates the Mask R-CNN model with the same architecture as training.
+    Calculate anchor sizes maintaining powers-of-2 progression.
+    
+    Args:
+        img_size: Target IMG_SIZE
+        base_img_size: Baseline IMG_SIZE (default: 1280)
+        base_min_anchor: Minimum anchor size at baseline (default: 16)
+    
+    Returns:
+        Tuple of anchor sizes following geometric progression
+    """
+    scale_factor = img_size / base_img_size
+    min_anchor = int(round(base_min_anchor * scale_factor))
+    
+    # Generate anchors as powers of 2: 1x, 2x, 4x, 8x, 16x
+    anchor_sizes = tuple(min_anchor * (2**i) for i in range(5))
+    return anchor_sizes
+
+def get_model_instance_segmentation(num_classes, mask_resolution=56):
+    """
+    Creates Mask R-CNN model with customizable mask resolution for small objects.
     Must match exactly with the training configuration.
     """
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-        weights="DEFAULT"
-    )
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
     
-    # Apply the same custom anchor generator as training
+    # Calculate ROI pooling size (typically half of final mask resolution)
+    roi_pool_size = mask_resolution // 2
+    
+    # Increase ROI pooling resolution for masks
+    model.roi_heads.mask_roi_pool.output_size = (roi_pool_size, roi_pool_size)
+    print(f"Mask ROI pool size set to: {roi_pool_size}×{roi_pool_size}")
+    print(f"Target mask resolution: {mask_resolution}×{mask_resolution}")
+    
+    # Optimize anchor generator for small objects using dynamic calculation
     anchor_generator = torchvision.models.detection.anchor_utils.AnchorGenerator(
-        sizes=((16,), (32,), (64,), (128,), (256,)),  # Match training exactly
-        aspect_ratios=((0.5, 1.0, 2.0),) * 5  # Match training exactly
+        sizes=tuple((size,) for size in get_anchor_sizes(IMG_SIZE, base_min_anchor=BASE_MIN_ANCHOR)),
+        aspect_ratios=((0.5, 1.0, 2.0),) * 5  # 5 tuples for 5 feature maps
     )
-    
     model.rpn.anchor_generator = anchor_generator
     
-    # Replace box classifier (same as before)
+    # Replace box predictor
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(
-        in_features, num_classes
-    )
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     
-    # Replace mask predictor (same as before)
-    in_features_mask = (
-        model.roi_heads.mask_predictor.conv5_mask.in_channels
-    )
+    # Replace mask predictor with high-resolution version
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(
-        in_features_mask,
-        hidden_layer,
-        num_classes
+    model.roi_heads.mask_predictor = HighResMaskRCNNPredictor(
+        in_features_mask, hidden_layer, num_classes, mask_resolution
     )
     
+    print(f"Model configured for {mask_resolution}×{mask_resolution} masks")
     return model
 
 
@@ -96,6 +185,70 @@ def get_inference_transforms():
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
+
+class HighResMaskRCNNPredictor(torch.nn.Module):
+    def __init__(self, in_channels, dim_reduced, num_classes, mask_size):
+        super().__init__()
+        self.mask_size = mask_size
+        
+        # Determine number of conv layers based on resolution
+        if mask_size <= 28:
+            # Standard configuration for 28×28
+            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+            self.relu = torch.nn.ReLU(inplace=True)
+            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+            
+        elif mask_size <= 56:
+            # Enhanced configuration for 56×56
+            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+            self.relu1 = torch.nn.ReLU(inplace=True)
+            self.conv6_mask = torch.nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+            self.relu2 = torch.nn.ReLU(inplace=True)
+            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+            
+        elif mask_size <= 112:
+            # Advanced configuration for 112×112
+            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+            self.relu1 = torch.nn.ReLU(inplace=True)
+            self.conv6_mask = torch.nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+            self.relu2 = torch.nn.ReLU(inplace=True)
+            self.conv7_mask = torch.nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+            self.relu3 = torch.nn.ReLU(inplace=True)
+            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+            
+        else:
+            raise ValueError(f"Mask resolution {mask_size} not supported. Use 28, 56, or 112.")
+        
+        # Initialize weights
+        for name, param in self.named_parameters():
+            if "weight" in name:
+                torch.nn.init.kaiming_normal_(param, mode="fan_out", nonlinearity="relu")
+            elif "bias" in name:
+                torch.nn.init.constant_(param, 0)
+    
+    def forward(self, x):
+        if self.mask_size <= 28:
+            x = self.conv5_mask(x)
+            x = self.relu(x)
+            x = self.mask_fcn_logits(x)
+            
+        elif self.mask_size <= 56:
+            x = self.conv5_mask(x)
+            x = self.relu1(x)
+            x = self.conv6_mask(x)
+            x = self.relu2(x)
+            x = self.mask_fcn_logits(x)
+            
+        elif self.mask_size <= 112:
+            x = self.conv5_mask(x)
+            x = self.relu1(x)
+            x = self.conv6_mask(x)
+            x = self.relu2(x)
+            x = self.conv7_mask(x)
+            x = self.relu3(x)
+            x = self.mask_fcn_logits(x)
+        
+        return x
 
 def calculate_transformation_params(original_height, original_width, 
                                   target_size=IMG_SIZE):
@@ -455,14 +608,25 @@ def save_visualization(image_path: str, predictions: dict,
     cv2.imwrite(output_path, overlay_image)
 
 # =============================================================================
-# MAIN INFERENCE AND CONVERSION FUNCTION
+# MAIN FUNCTION WITH ARGUMENT SUPPORT
 # =============================================================================
 
 def main():
     """
-    Main function that executes complete inference and conversion.
+    Main function that executes complete inference and conversion with argument support.
     """
+    # Parse command-line arguments
+    args = parse_arguments()
+    
+    # Update global variables with arguments
+    update_global_variables(args)
+    
     print(f"Using device: {DEVICE}")
+    print(f"Model path: {MODEL_PATH}")
+    print(f"Using class mapping: {CLASS_MAPPING}")
+    print(f"Input images folder: {INPUT_IMAGES_FOLDER}")
+    print(f"Output labels folder: {OUTPUT_LABELS_FOLDER}")
+    print(f"Output images folder: {OUTPUT_IMAGES_FOLDER}")
     
     # Create output folders
     os.makedirs(OUTPUT_LABELS_FOLDER, exist_ok=True)
@@ -470,7 +634,7 @@ def main():
     
     # Load trained model
     print("Loading Mask R-CNN model...")
-    model = get_model_instance_segmentation(NUM_CLASSES)
+    model = get_model_instance_segmentation(NUM_CLASSES, MASK_RESOLUTION)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.to(DEVICE)
     model.eval()
@@ -499,12 +663,6 @@ def main():
                     model, image_path, transforms, original_size
                 )
                 
-                # Optional: Use TTA for better results (slower but more accurate)
-                # image_for_tta = cv2.imread(image_path)
-                # image_for_tta = cv2.cvtColor(image_for_tta, cv2.COLOR_BGR2RGB)
-                # predictions_tta = predict_with_tta(model, image_for_tta, DEVICE)
-                # Use predictions_tta instead of predictions if using TTA
-
                 # Convert to YoloV11 format
                 yolo_annotations = convert_to_yolo_format(
                     predictions, original_size
