@@ -56,7 +56,7 @@ except ImportError:
 # =============================================================================
 
 # Model name. Relative path from ws
-MODEL_PATH = 'weights/m01.pth'
+MODEL_PATH = 'weights/ms01.pth'
 
 # Dataset paths
 DATASET_PATH = "dataset"
@@ -71,7 +71,7 @@ VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH,
 # Training parameters
 NUM_CLASSES = 3
 BATCH_SIZE = 1
-NUM_EPOCHS = 150
+NUM_EPOCHS = 200
 LEARNING_RATE = 0.0001
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -100,6 +100,7 @@ CLASS_NAMES = {0: "Chromis chromis", 1: "Coris julis"}  # Default class names
 
 # Other
 SMALL_OBJECT_MAX_AREA = 1000  # Number of pixels to be considered small
+LOSS_MASK_WEIGHT = 1.5
 
 # =============================================================================
 # ARGUMENT PARSING
@@ -424,8 +425,12 @@ def get_inference_transforms():
     """
     return A.Compose([
         A.LongestMaxSize(max_size=IMG_SIZE),
-        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, 
-                     border_mode=cv2.BORDER_CONSTANT, p=1.0),
+        A.PadIfNeeded(
+            min_height=IMG_SIZE,
+            min_width=IMG_SIZE,
+            border_mode=cv2.BORDER_CONSTANT,
+            p=1.0
+        ),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
@@ -866,7 +871,7 @@ def dice_coefficient(pred_mask, true_mask, smooth=1e-6):
     dice = (2.0 * intersection + smooth) / (union + smooth)
     return dice.item()
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch, 
+def train_one_epoch(model, optimizer, data_loader, device, epoch,
                    dice_weight: float = 2.0, use_focal_dice: bool = True):
     """
     Enhanced training with IoU-based mask matching for accurate dice loss.
@@ -880,7 +885,7 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
 
     for batch_idx, (images, targets) in enumerate(data_loader):
         images = [image.to(device) for image in images]
-        targets = [{k: v.to(device) for k, v in t.items()} 
+        targets = [{k: v.to(device) for k, v in t.items()}
                   for t in targets]
 
         optimizer.zero_grad(set_to_none=True)
@@ -890,86 +895,90 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
         
         # Calculate standard Mask R-CNN losses with optimized weights
         standard_losses = (
-            loss_dict['loss_classifier'] * 1.0 +      # Classification loss
-            loss_dict['loss_box_reg'] * 1.0 +         # Box regression loss  
-            loss_dict['loss_mask'] * 1.5 +            # Standard mask loss
-            loss_dict['loss_objectness'] * 1.0 +      # RPN objectness loss
-            loss_dict['loss_rpn_box_reg'] * 1.0       # RPN box regression
+            loss_dict['loss_classifier'] * 1.0 +         # Classification loss
+            loss_dict['loss_box_reg'] * 1.0 +            # Box regression loss
+            loss_dict['loss_mask'] * LOSS_MASK_WEIGHT +  # Standard mask loss
+            loss_dict['loss_objectness'] * 1.0 +         # RPN objectness loss
+            loss_dict['loss_rpn_box_reg'] * 1.0          # RPN box regression
         )
         
-        # Initialize dice_loss_value as None
-        dice_loss_value = None
-        
-        # Get predictions for dice loss computation
-        model.eval()
-        with torch.no_grad():
-            predictions = model(images)
-        model.train()
-        
-        # Compute dice loss for each image in the batch
-        batch_dice_losses = []
-        batch_matches = 0
-        
-        for pred, target in zip(predictions, targets):
-            if (len(pred['masks']) > 0 and len(target['masks']) > 0 and 
-                pred['scores'].max() > 0.1):
-                
-                # Resize predicted masks to match target size if needed
-                pred_masks = pred['masks']
-                target_masks = target['masks']
-                
-                if pred_masks.shape[-2:] != target_masks.shape[-2:]:
-                    target_h, target_w = target_masks.shape[-2:]
-                    pred_masks = F.interpolate(
-                        pred_masks, size=(target_h, target_w), 
-                        mode='bilinear', align_corners=False
-                    )
-                
-                # Match masks using IoU scoring
-                matches = match_masks_by_iou(
-                    pred_masks=pred_masks,
-                    target_masks=target_masks,
-                    pred_boxes=pred['boxes'],
-                    target_boxes=target['boxes'],
-                    pred_scores=pred['scores'],
-                    iou_threshold=0.3,  # Minimum IoU for valid match
-                    score_threshold=0.1  # Minimum confidence for predictions
-                )
-                
-                # Compute dice loss only for matched pairs
-                if matches:
-                    matched_dice_losses = []
-                    
-                    for pred_idx, target_idx in matches:
-                        pred_mask = pred_masks[pred_idx:pred_idx+1]
-                        target_mask = target_masks[target_idx:target_idx+1]
-                        
-                        if use_focal_dice:
-                            pair_dice_loss = focal_dice_loss(pred_mask, 
-                                                           target_mask)
-                        else:
-                            pair_dice_loss = dice_loss_for_masks(pred_mask, 
-                                                               target_mask)
-                        
-                        matched_dice_losses.append(pair_dice_loss)
-                    
-                    # Average dice loss for matched pairs in this image
-                    if matched_dice_losses:
-                        image_dice_loss = torch.stack(matched_dice_losses).mean()
-                        batch_dice_losses.append(image_dice_loss)
-                        batch_matches += len(matches)
-        
-        # Average dice loss for the batch
-        if batch_dice_losses:
-            dice_loss_value = torch.stack(batch_dice_losses).mean()
+        # Skip dice calculations if dice_weight is 0
+        if dice_weight == 0:
+            dice_loss_value = torch.tensor(0.0, device=device, 
+                                         requires_grad=True)
+            total_batch_loss = standard_losses
         else:
-            # Create a zero tensor connected to the computation graph
-            dice_loss_value = standard_losses * 0.0
-        
-        num_matched_pairs += batch_matches
-        
-        # Combine losses with weighting
-        total_batch_loss = standard_losses + dice_weight * dice_loss_value
+            # Initialize dice_loss_value as None
+            dice_loss_value = None
+            
+            # Get predictions for dice loss computation
+            model.eval()
+            with torch.no_grad():
+                predictions = model(images)
+            model.train()
+            
+            # Compute dice loss for each image in the batch
+            batch_dice_losses = []
+            batch_matches = 0
+            
+            for pred, target in zip(predictions, targets):
+                if (len(pred['masks']) > 0 and len(target['masks']) > 0 and
+                    pred['scores'].max() > 0.1):
+                    
+                    # Resize predicted masks to match target size if needed
+                    pred_masks = pred['masks']
+                    target_masks = target['masks']
+                    
+                    if pred_masks.shape[-2:] != target_masks.shape[-2:]:
+                        target_h, target_w = target_masks.shape[-2:]
+                        pred_masks = F.interpolate(
+                            pred_masks, size=(target_h, target_w),
+                            mode='bilinear', align_corners=False
+                        )
+                    
+                    # Match masks using IoU scoring
+                    matches = match_masks_by_iou(
+                        pred_masks=pred_masks,
+                        target_masks=target_masks,
+                        pred_boxes=pred['boxes'],
+                        target_boxes=target['boxes'],
+                        pred_scores=pred['scores'],
+                        iou_threshold=0.3,  # Minimum IoU for valid match
+                        score_threshold=0.1 # Minimum confidence for predictions
+                    )
+                    
+                    # Compute dice loss only for matched pairs
+                    if matches:
+                        matched_dice_losses = []
+                        for pred_idx, target_idx in matches:
+                            pred_mask = pred_masks[pred_idx:pred_idx+1]
+                            target_mask = target_masks[target_idx:target_idx+1]
+                            
+                            if use_focal_dice:
+                                pair_dice_loss = focal_dice_loss(pred_mask,
+                                                               target_mask)
+                            else:
+                                pair_dice_loss = dice_loss_for_masks(pred_mask,
+                                                                   target_mask)
+                            matched_dice_losses.append(pair_dice_loss)
+                        
+                        # Average dice loss for matched pairs in this image
+                        if matched_dice_losses:
+                            image_dice_loss = torch.stack(matched_dice_losses).mean()
+                            batch_dice_losses.append(image_dice_loss)
+                            batch_matches += len(matches)
+            
+            # Average dice loss for the batch
+            if batch_dice_losses:
+                dice_loss_value = torch.stack(batch_dice_losses).mean()
+            else:
+                # Create a zero tensor connected to the computation graph
+                dice_loss_value = standard_losses * 0.0
+            
+            num_matched_pairs += batch_matches
+            
+            # Combine losses with weighting
+            total_batch_loss = standard_losses + dice_weight * dice_loss_value
         
         # Backward pass
         total_batch_loss.backward()
@@ -986,26 +995,37 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
         num_batches += 1
 
         # Memory cleanup
-        del images, targets, loss_dict, predictions
+        del images, targets, loss_dict
         del standard_losses, dice_loss_value, total_batch_loss
-
+        if dice_weight != 0:
+            del predictions
+        
         if batch_idx % 4 == 0:
             torch.cuda.empty_cache()
 
         # Print detailed loss information for first epoch
-        if epoch == 1 and batch_idx < 5:
-            print(f"Batch {batch_idx}: Total={total_loss/num_batches:.4f}, "
-                  f"Standard={total_standard_loss/num_batches:.4f}, "
-                  f"Dice={total_dice_loss/num_batches:.4f}, "
-                  f"Matches={batch_matches}")
-
+        # if epoch == 1 and batch_idx < 5:
+        #     if dice_weight != 0:
+        #         print(f"Batch {batch_idx}: Total={total_loss/num_batches:.4f}, "
+        #               f"Standard={total_standard_loss/num_batches:.4f}, "
+        #               f"Dice={total_dice_loss/num_batches:.4f}, "
+        #               f"Matches={batch_matches if dice_weight != 0 else 'N/A'}")
+        #     else:
+        #         print(f"Batch {batch_idx}: Total={total_loss/num_batches:.4f}, "
+        #               f"Standard={total_standard_loss/num_batches:.4f}, "
+        #               f"Dice=Skipped")
+    
     avg_total_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_dice_loss = total_dice_loss / num_batches if num_batches > 0 else 0.0
     avg_matches_per_batch = num_matched_pairs / num_batches if num_batches > 0 else 0.0
     
-    print(f"Epoch {epoch} - Total Loss: {avg_total_loss:.4f}, "
-          f"Dice Loss Component: {avg_dice_loss:.4f}, "
-          f"Avg Matches/Batch: {avg_matches_per_batch:.1f}")
+    if dice_weight != 0:
+        print(f"Epoch {epoch} - Total Loss: {avg_total_loss:.4f}, "
+              f"Dice Loss Component: {avg_dice_loss:.4f}, "
+              f"Avg Matches/Batch: {avg_matches_per_batch:.1f}")
+    else:
+        print(f"Epoch {epoch} - Total Loss: {avg_total_loss:.4f}, "
+              f"Dice Loss: Skipped (dice_weight=0)")
     
     return avg_total_loss
 
@@ -1092,13 +1112,21 @@ def calculate_validation_loss(model, data_loader, device):
     with torch.no_grad():
         for images, targets in data_loader:
             images = [image.to(device) for image in images]
-            targets = [{k: v.to(device) for k, v in t.items()} 
+            targets = [{k: v.to(device) for k, v in t.items()}
                       for t in targets]
             
             loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
             
-            total_loss += losses.item()
+            # Apply same weights as in training
+            weighted_losses = (
+                loss_dict['loss_classifier'] * 1.0 +
+                loss_dict['loss_box_reg'] * 1.0 +
+                loss_dict['loss_mask'] * LOSS_MASK_WEIGHT +
+                loss_dict['loss_objectness'] * 1.0 +
+                loss_dict['loss_rpn_box_reg'] * 1.0
+            )
+            
+            total_loss += weighted_losses.item()
             num_batches += 1
     
     model.eval()
@@ -1184,7 +1212,7 @@ def reverse_mask_transformation(mask, transform_params):
         print(f"Error in reverse_mask_transformation: {e}")
         return None
 
-def inference_on_image(model, image_path, transforms, original_size):
+def inference_on_image(model, image_path, transforms):
     """
     Performs standard inference on a specific image.
     """
@@ -1213,12 +1241,11 @@ def inference_on_image(model, image_path, transforms, original_size):
         'masks': pred['masks'][high_conf_indices].cpu().numpy()
     }
     
-    return filtered_results, original_size
+    return filtered_results
 
 def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
     """
     Creates a transparent overlay of predicted masks on the original image.
-    Fixed version with proper None checking.
     """
     # Create a copy of the original image
     result_image = image.copy()
@@ -1244,7 +1271,7 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
         print("No masks to process")
         return result_image
     
-    # Process each mask with proper None checking
+    # Process each mask
     for i in range(len(masks)):
         try:
             # Check if mask exists and is not None
@@ -1332,7 +1359,7 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
     
     return result_image
 
-def save_inference_examples(model, train_dataset, val_dataset, output_path):
+def save_inference_examples(model, output_path):
     """
     Generate inference examples for the training report with enhanced error handling.
     Uses all images from the test folder instead of train/validation datasets.
@@ -1360,7 +1387,7 @@ def save_inference_examples(model, train_dataset, val_dataset, output_path):
                 test_original_size = (img.height, img.width)
             
             test_predictions, _ = inference_on_image(
-                model, test_image_path, transforms, test_original_size
+                model, test_image_path, transforms
             )
             
             test_image = cv2.imread(test_image_path)
@@ -1387,7 +1414,7 @@ def save_inference_examples(model, train_dataset, val_dataset, output_path):
 # PDF REPORT GENERATION
 # =============================================================================
 
-def generate_training_report(train_losses, val_losses, val_dice_scores, 
+def generate_training_report(train_losses, val_losses, final_dice, 
                            test_image_paths, 
                            training_start_time, training_end_time):
     """
@@ -1440,7 +1467,8 @@ def generate_training_report(train_losses, val_losses, val_dice_scores,
     story.append(Paragraph(f"<b>Total Duration:</b> {str(training_duration).split('.')[0]}", summary_style))
     story.append(Paragraph(f"<b>Final Training Loss:</b> {train_losses[-1]:.4f}", summary_style))
     story.append(Paragraph(f"<b>Final Validation Loss:</b> {val_losses[-1]:.4f}", summary_style))
-    story.append(Paragraph(f"<b>Best Dice Score:</b> {max(val_dice_scores):.4f}", summary_style))
+    story.append(Paragraph(f"<b>Best Validation Loss:</b> {min(val_losses):.4f}", summary_style))
+    story.append(Paragraph(f"<b>Final Dice Coefficient:</b> {(final_dice):.4f}", summary_style))
     story.append(Spacer(1, 20))
     
     # Configuration Table - Automatic Global Variable Extraction
@@ -1659,31 +1687,44 @@ def main():
     model.to(DEVICE)
 
     # Enhanced optimizer and scheduler setup
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE,
-                           weight_decay=0.0001)                ##################################
+    optimizer = optim.AdamW(model.parameters(), 
+                        lr=LEARNING_RATE,
+                        weight_decay=0.0005,
+                        betas=(0.9, 0.999),
+                        eps=1e-8)
 
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
-                                              milestones=[100, 150],
-                                              gamma=0.1)  ##########################################
 
-    # Warmup scheduler for first few epochs
-    warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer,
-                                                  start_factor=0.1,
-                                                  total_iters=10)
+    # # Learning rate scheduler
+    # scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
+    #                                           milestones=[100, 150],
+    #                                           gamma=0.1)
+
+    # # Warmup scheduler for first few epochs
+    # warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer,
+    #                                               start_factor=0.1,
+    #                                               total_iters=10)
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=15,
+        min_lr=1e-7
+    )
 
     # Training metrics
     train_losses = []
     val_losses = []
-    val_dice_scores = []
+    best_val_loss = float('inf')  # Track best validation loss
 
     print("Starting enhanced training for small objects...")
+
     for epoch in range(NUM_EPOCHS):
         print(f"\n--- Epoch {epoch+1}/{NUM_EPOCHS} ---")
-        print(f"Memory before epoch: "
-              f"{torch.cuda.memory_allocated()/1024**3:.2f}GB allocated, "
-              f"{torch.cuda.memory_reserved()/1024**3:.2f}GB reserved")
-
+        # print(f"Memory before epoch: "
+        #     f"{torch.cuda.memory_allocated()/1024**3:.2f}GB allocated, "
+        #     f"{torch.cuda.memory_reserved()/1024**3:.2f}GB reserved")
+        
         # Training
         train_loss = train_one_epoch(
             model,
@@ -1694,43 +1735,36 @@ def main():
             dice_weight=DICE_WEIGHT,
             use_focal_dice=USE_FOCAL_DICE
         )
-
         train_losses.append(train_loss)
         del train_loss
         clear_gpu_memory()
-
-        # Update learning rate
-        if epoch < 10:
-            warmup_scheduler.step()
-        else:
-            scheduler.step()
-
+        
+        # # Update learning rate
+        # if epoch < 10:
+        #     warmup_scheduler.step()
+        # else:
+        #     scheduler.step()
+        
         # Validation
         val_loss = calculate_validation_loss(model, val_loader, DEVICE)
         val_losses.append(val_loss)
-        del val_loss
-        clear_gpu_memory()
-
-        # Evaluation
-        val_dice = evaluate_model(model, val_loader, DEVICE)
-        val_dice_scores.append(val_dice)
-        del val_dice
-        clear_gpu_memory()
-
+        
         print(f"Training loss: {train_losses[-1]:.4f}")
         print(f"Validation loss: {val_losses[-1]:.4f}")
-        print(f"Validation Dice: {val_dice_scores[-1]:.4f}")
         print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
-        print(f"Memory after epoch: "
-              f"{torch.cuda.memory_allocated()/1024**3:.2f}GB allocated, "
-              f"{torch.cuda.memory_reserved()/1024**3:.2f}GB reserved")
+        # print(f"Memory after epoch: "
+        #     f"{torch.cuda.memory_allocated()/1024**3:.2f}GB allocated, "
+        #     f"{torch.cuda.memory_reserved()/1024**3:.2f}GB reserved")
+        
+        scheduler.step(val_losses[-1])
 
-        # Save best model
-        if (not val_dice_scores[:-1] or
-            val_dice_scores[-1] > max(val_dice_scores[:-1])):
+        # Save model when validation loss improves
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             torch.save(model.state_dict(), MODEL_PATH)
-            print(f"Model saved as: {MODEL_PATH}")
-
+            print(f"Model saved (val_loss improved to {val_loss:.4f}): {MODEL_PATH}")
+        
+        del val_loss
         clear_gpu_memory()
 
     # Record training end time
@@ -1755,10 +1789,10 @@ def main():
     plt.grid(True, alpha=0.3)
 
     plt.subplot(1, 2, 2)
-    plt.plot(val_dice_scores, color='green')
-    plt.title('Validation Dice Score')
+    plt.plot(val_losses, color='orange')
+    plt.title('Validation Loss Progress')
     plt.xlabel('Epoch')
-    plt.ylabel('Dice Score')
+    plt.ylabel('Validation Loss')
     plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -1767,21 +1801,17 @@ def main():
     plt.close() # Close instead of show to avoid display
 
     # Generate inference examples
-    print("Generating inference examples for report...")
-    test_inference_paths = save_inference_examples(
-        model, train_dataset, val_dataset, TEMP_FIGURES_PATH
-    )
+    print("Generating inference examples for report over test dataset.")
+    test_inference_paths = save_inference_examples(model, TEMP_FIGURES_PATH)
 
     # Generate PDF report
     print("Generating PDF training report...")
     report_path = generate_training_report(
-        train_losses, val_losses, val_dice_scores,
+        train_losses, val_losses, final_dice,
         test_inference_paths,
         training_start_time, training_end_time
     )
 
-    print(f"\nEnhanced training completed. Best Dice Score: "
-          f"{max(val_dice_scores) if val_dice_scores else 0.0:.4f}")
     print(f"Final Training Loss: {train_losses[-1]:.4f}")
     print(f"Final Validation Loss: {val_losses[-1]:.4f}")
     if report_path:

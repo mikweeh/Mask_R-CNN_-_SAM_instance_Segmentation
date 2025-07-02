@@ -131,7 +131,7 @@ def update_global_variables(args):
     MIN_CONTOUR_AREA = args.min_contour_area
     SIMPLIFICATION_TOLERANCE = args.simplification_tolerance
     
-    # NEW: Handle simplification control logic
+    # Handle simplification control logic
     if args.disable_simplification:
         ENABLE_SIMPLIFICATION = False
         print("Simplification DISABLED via --disable_simplification")
@@ -142,7 +142,7 @@ def update_global_variables(args):
         ENABLE_SIMPLIFICATION = ENABLE_SIMPLIFICATION  # Use default
         print(f"Using default simplification setting: {ENABLE_SIMPLIFICATION}")
     
-    # NEW: Update minimum polygon points
+    # Update minimum polygon points
     MIN_POLYGON_POINTS = args.min_polygon_points
     print(f"Minimum polygon points set to: {MIN_POLYGON_POINTS}")
     
@@ -589,7 +589,7 @@ def normalize_polygon(polygon_coords, image_height, image_width):
         normalized_coords.extend([x, y])
     return normalized_coords
 
-def inference_on_image(model, image_path, transforms, original_size):
+def inference_on_image(model, image_path, transforms):
     """
     Performs inference on a specific image.
     
@@ -597,7 +597,6 @@ def inference_on_image(model, image_path, transforms, original_size):
         model: Loaded Mask R-CNN model
         image_path: Path to image
         transforms: Albumentations transformations
-        original_size: Tuple (height, width) of original image size
     
     Returns:
         Dictionary with inference results
@@ -628,7 +627,7 @@ def inference_on_image(model, image_path, transforms, original_size):
         'masks': pred['masks'][high_conf_indices].cpu().numpy()
     }
     
-    return filtered_results, original_size
+    return filtered_results
     
 
 def convert_to_yolo_format(predictions, original_size):
@@ -840,7 +839,7 @@ def main():
             try:
                 # Perform inference
                 predictions, _ = inference_on_image(
-                    model, image_path, transforms, original_size
+                    model, image_path, transforms
                 )
                 
                 # Convert to YoloV11 format with enhanced control
