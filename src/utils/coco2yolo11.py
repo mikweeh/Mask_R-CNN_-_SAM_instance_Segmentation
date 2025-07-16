@@ -2,12 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 This script makes inference of Mask R-CNN and transforms the resulting
-inferenced masks into YoloV11 format with configurable simplification options.
+inferenced masks into YoloV11 format with improved mask processing.
 """
+
+# TO DO: get_model_instance_segmentation() is used here and also
+# at train.py, so it should be placed as a helper function and imported
+# instead of being duplicated
 
 import argparse
 import os
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
@@ -17,14 +23,13 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 import json
-from shapely import Polygon
 
 # =============================================================================
 # DEFAULT GLOBAL CONFIGURATION VARIABLES
 # =============================================================================
 
 # Paths and files
-MODEL_PATH = 'weights/m01_1.pth'
+MODEL_PATH = 'weights/m01_x.pth'
 INPUT_IMAGES_FOLDER = 'dataset/test'
 OUTPUT_LABELS_FOLDER = 'dataset/inference/labels'
 OUTPUT_IMAGES_FOLDER = 'dataset/inference/images'
@@ -37,23 +42,20 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MASK_RESOLUTION = 56
 BASE_MIN_ANCHOR = 16
 
-# Polygon conversion parameters - ENHANCED WITH NEW OPTIONS
-MIN_CONTOUR_AREA = 50
-SIMPLIFICATION_TOLERANCE = 1.4
-
-# Simplification control options
-ENABLE_SIMPLIFICATION = False
-MIN_POLYGON_POINTS = 25
+# NEW: Class-specific area filtering (from pruebas_masks.py)
+MIN_MASK_AREA_ORIGINAL = [256, 100]  # Minimum area in original image pixels 
+                                     # (256 for chromis and 100 for coris)
+MIN_CONTOUR_AREA = 64  # Minimum pixels in inference space (2048×2048)
 
 # Default class mapping - can be overridden by arguments from main.py
-CLASS_MAPPING = {1: 0, 2: 1} # Default: COCO class IDs to YOLO class IDs
+CLASS_MAPPING = {1: 0, 2: 1}  # Default: COCO class IDs to YOLO class IDs
 
 # =============================================================================
-# ARGUMENT PARSING - ENHANCED WITH NEW OPTIONS
+# ARGUMENT PARSING - UPDATED
 # =============================================================================
 
 def parse_arguments():
-    """Parse command-line arguments with new simplification options."""
+    """Parse command-line arguments with updated options."""
     parser = argparse.ArgumentParser(
         description='Convert Mask R-CNN predictions to YOLOv11 format'
     )
@@ -86,25 +88,14 @@ def parse_arguments():
                        default=BASE_MIN_ANCHOR,
                        help='Base minimum anchor size')
     
-    # Enhanced polygon conversion parameters
+    # NEW: Class-specific area thresholds
     parser.add_argument('--min_contour_area', type=int,
                        default=MIN_CONTOUR_AREA,
-                       help='Minimum contour area to consider')
-    parser.add_argument('--simplification_tolerance', type=float,
-                       default=SIMPLIFICATION_TOLERANCE,
-                       help='Tolerance for polygon simplification')
+                       help='Minimum contour area in inference space')
     
-    # NEW: Simplification control arguments
-    parser.add_argument('--enable_simplification', action='store_true',
-                       default=ENABLE_SIMPLIFICATION,
-                       help='Enable polygon simplification (default: True)')
-    parser.add_argument('--disable_simplification', action='store_true',
-                       help='Disable polygon simplification completely')
-    parser.add_argument('--min_polygon_points', type=int,
-                       default=MIN_POLYGON_POINTS,
-                       help='Minimum number of points to maintain in polygon')
+    # NOTE: Removed simplification arguments as they're no longer used
     
-    # Class configuration argument (optional - will override default if provided)
+    # Class configuration argument
     parser.add_argument('--class_mapping', type=str, default=None,
                        help='JSON string with COCO to YOLO class mapping')
     
@@ -115,8 +106,7 @@ def update_global_variables(args):
     global MODEL_PATH, INPUT_IMAGES_FOLDER, OUTPUT_LABELS_FOLDER
     global OUTPUT_IMAGES_FOLDER, NUM_CLASSES, IMG_SIZE, CONFIDENCE_THRESHOLD
     global MASK_RESOLUTION, BASE_MIN_ANCHOR, CLASS_MAPPING
-    global MIN_CONTOUR_AREA, SIMPLIFICATION_TOLERANCE
-    global ENABLE_SIMPLIFICATION, MIN_POLYGON_POINTS  # NEW globals
+    global MIN_CONTOUR_AREA
     
     # Update standard global variables
     MODEL_PATH = args.model_path
@@ -129,274 +119,129 @@ def update_global_variables(args):
     MASK_RESOLUTION = args.mask_resolution
     BASE_MIN_ANCHOR = args.base_min_anchor
     MIN_CONTOUR_AREA = args.min_contour_area
-    SIMPLIFICATION_TOLERANCE = args.simplification_tolerance
-    
-    # Handle simplification control logic
-    if args.disable_simplification:
-        ENABLE_SIMPLIFICATION = False
-        print("Simplification DISABLED via --disable_simplification")
-    elif args.enable_simplification:
-        ENABLE_SIMPLIFICATION = True
-        print("Simplification ENABLED via --enable_simplification")
-    else:
-        ENABLE_SIMPLIFICATION = ENABLE_SIMPLIFICATION  # Use default
-        print(f"Using default simplification setting: {ENABLE_SIMPLIFICATION}")
-    
-    # Update minimum polygon points
-    MIN_POLYGON_POINTS = args.min_polygon_points
-    print(f"Minimum polygon points set to: {MIN_POLYGON_POINTS}")
     
     # Update class configuration ONLY if provided as argument
     if args.class_mapping is not None:
         CLASS_MAPPING = json.loads(args.class_mapping)
-        # Convert string keys to integers (JSON converts int keys to strings)
+        # Convert string keys to integers
         CLASS_MAPPING = {int(k): v for k, v in CLASS_MAPPING.items()}
         print(f"Updated CLASS_MAPPING from arguments: {CLASS_MAPPING}")
     else:
         print(f"Using default CLASS_MAPPING: {CLASS_MAPPING}")
 
 # =============================================================================
-# ENHANCED SIMPLIFICATION METHOD WITH MINIMUM POINTS CONTROL
-# =============================================================================
-
-def simplify_polygon_with_configurable_options(points, image_dimensions, 
-                                              tolerance=2.0, 
-                                              enable_simplification=True,
-                                              min_points=25):
-    """
-    Enhanced simplification with full control over the process.
-    
-    Args:
-        points: List of (x, y) coordinate tuples (normalized 0-1)
-        image_dimensions: Tuple (width, height) of image
-        tolerance: Simplification tolerance
-        enable_simplification: Whether to apply simplification at all
-        min_points: Minimum number of points to maintain
-    
-    Returns:
-        List of simplified (x, y) coordinate tuples (normalized 0-1)
-    """
-    initial_point_count = len(points)
-    print(f"Initial points: {initial_point_count}")
-    
-    # OPTION 1: Skip simplification entirely if disabled
-    if not enable_simplification:
-        print("Simplification DISABLED - returning original points")
-        return points
-    
-    # OPTION 2: Skip simplification if already below minimum threshold
-    if initial_point_count <= min_points:
-        print(f"Already at or below minimum points ({min_points}) - "
-              f"skipping simplification")
-        return points
-    
-    # OPTION 3: Apply simplification with minimum points protection
-    try:
-        print(f"Applying simplification (tolerance={tolerance})")
-        
-        # Scale normalized coordinates (0-1) to image dimensions
-        # (Exact code from your label_simplify.py lines 138-141)
-        scaled_points = [
-            (x * image_dimensions[0], y * image_dimensions[1])
-            for x, y in points
-        ]
-        
-        # Create Shapely polygon (your exact method from line 144)
-        polygon = Polygon(scaled_points)
-        
-        # Apply simplification (your exact method from lines 175-178)
-        simplified_polygon = polygon.simplify(
-            tolerance=tolerance,
-            preserve_topology=True
-        )
-        
-        final_points = list(simplified_polygon.exterior.coords)[0:-1]  # Remove duplicate
-        
-        # NEW: Check if simplification resulted in too few points
-        if len(final_points) < min_points:
-            print(f"Warning: Simplification reduced points to {len(final_points)}, "
-                  f"which is below minimum {min_points}")
-            print("Trying with reduced tolerance...")
-            
-            # Try with progressively smaller tolerance values
-            for reduced_tolerance in [tolerance * 0.5, tolerance * 0.25, tolerance * 0.1]:
-                try:
-                    reduced_simplified = polygon.simplify(
-                        tolerance=reduced_tolerance,
-                        preserve_topology=True
-                    )
-                    reduced_points = list(reduced_simplified.exterior.coords)[0:-1]
-                    
-                    if len(reduced_points) >= min_points:
-                        print(f"Success with reduced tolerance {reduced_tolerance}: "
-                              f"{len(reduced_points)} points")
-                        final_points = reduced_points
-                        break
-                except Exception as e:
-                    print(f"Error with tolerance {reduced_tolerance}: {e}")
-                    continue
-            
-            # If still too few points, return original
-            if len(final_points) < min_points:
-                print(f"Could not maintain minimum {min_points} points, "
-                      f"returning original {initial_point_count} points")
-                return points
-        
-        # Safety check: ensure at least 3 points for valid polygon
-        if len(final_points) < 3:
-            print(f"Critical: Simplified to {len(final_points)} points, "
-                  f"returning original polygon")
-            return points
-        
-        # Convert back to normalized coordinates (0-1)
-        # (your exact method from lines 193-196)
-        new_points = []
-        for x, y in final_points:
-            new_points.append((x / image_dimensions[0], y / image_dimensions[1]))
-        
-        print(f"Final simplified points: {len(final_points)} "
-              f"(reduced from {initial_point_count})")
-        
-        return new_points
-        
-    except Exception as e:
-        # If there's an error, keep the original (your exact logic)
-        print(f"Error during simplification: {e}")
-        print("Returning original points")
-        return points
-
-def mask_to_polygon(mask, image_dimensions, min_area=50, 
-                   simplification_tolerance=2.0,
-                   enable_simplification=True,
-                   min_polygon_points=25):
-    """
-    Converts a binary mask to polygon coordinates with enhanced simplification control.
-    Now selects the contour with the LARGEST PERIMETER instead of middle by area.
-    
-    Args:
-        mask: Binary mask numpy array
-        image_dimensions: Tuple (width, height) of original image
-        min_area: Minimum area to consider a valid contour
-        simplification_tolerance: Tolerance for polygon simplification
-        enable_simplification: Whether to apply simplification
-        min_polygon_points: Minimum points to maintain in polygon
-    
-    Returns:
-        List of polygon coordinates in format [x1, y1, x2, y2, ...]
-    """
-    # Convert mask to uint8
-    mask_uint8 = (mask * 255).astype(np.uint8)
-    
-    # Find contours with full precision (no approximation)
-    contours, _ = cv2.findContours(
-        mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-    )
-    
-    if not contours:
-        return []
-    
-    # Filter contours by minimum area
-    valid_contours = []
-    for contour in contours:
-        if cv2.contourArea(contour) >= min_area:
-            valid_contours.append(contour)
-    
-    if not valid_contours:
-        return []
-    
-    # Calculate perimeter (arc length) for each valid contour
-    contour_perimeters = []
-    for i, contour in enumerate(valid_contours):
-        perimeter = cv2.arcLength(contour, True)  # True = closed contour
-        area = cv2.contourArea(contour)
-        num_points = len(contour)
-        contour_perimeters.append((i, perimeter, area, num_points))
-        print(f"Contour {i}: perimeter={perimeter:.1f}, area={area:.1f}, points={num_points}")
-    
-    # Sort by perimeter (descending) and select the largest
-    contour_perimeters.sort(key=lambda x: x[1], reverse=True)  # Sort by perimeter
-    largest_perimeter_index = contour_perimeters[0][0]
-    selected_contour = valid_contours[largest_perimeter_index]
-    
-    # Debug information
-    selected_perimeter = contour_perimeters[0][1]
-    selected_area = contour_perimeters[0][2]
-    selected_points = contour_perimeters[0][3]
-    
-    print(f"Selected contour with LARGEST PERIMETER:")
-    print(f"  - Index: {largest_perimeter_index}")
-    print(f"  - Perimeter: {selected_perimeter:.1f}")
-    print(f"  - Area: {selected_area:.1f}")
-    print(f"  - Points: {selected_points}")
-    
-    # Convert contour to normalized points
-    mask_height, mask_width = mask.shape
-    points = []
-    for point in selected_contour:
-        x, y = point[0]
-        # Normalize to 0-1 range
-        norm_x = x / mask_width
-        norm_y = y / mask_height
-        points.append((norm_x, norm_y))
-    
-    print(f"Converted to {len(points)} normalized points")
-    
-    # Apply enhanced simplification method with all options
-    simplified_points = simplify_polygon_with_configurable_options(
-        points, 
-        image_dimensions, 
-        tolerance=simplification_tolerance,
-        enable_simplification=enable_simplification,
-        min_points=min_polygon_points
-    )
-    
-    print(f"Final polygon has {len(simplified_points)} points")
-    
-    # Convert to flat coordinate list
-    polygon_coords = []
-    for x, y in simplified_points:
-        polygon_coords.extend([x, y])
-    
-    return polygon_coords
-
-# =============================================================================
-# AUXILIARY FUNCTIONS
+# AUXILIARY FUNCTIONS (UNCHANGED)
 # =============================================================================
 
 def get_anchor_sizes(img_size, base_img_size=1280, base_min_anchor=16):
-    """
-    Calculate anchor sizes maintaining powers-of-2 progression.
-    
-    Args:
-        img_size: Target IMG_SIZE
-        base_img_size: Baseline IMG_SIZE (default: 1280)
-        base_min_anchor: Minimum anchor size at baseline (default: 16)
-    
-    Returns:
-        Tuple of anchor sizes following geometric progression
-    """
+    """Calculate anchor sizes maintaining powers-of-2 progression."""
     scale_factor = img_size / base_img_size
     min_anchor = int(round(base_min_anchor * scale_factor))
-    # Generate anchors as powers of 2: 1x, 2x, 4x, 8x, 16x
     anchor_sizes = tuple(min_anchor * (2**i) for i in range(5))
     return anchor_sizes
 
-def get_model_instance_segmentation(num_classes, mask_resolution=56):
+def get_model_instance_segmentation(num_classes, mask_resolution=28):
     """
     Creates Mask R-CNN model with customizable mask resolution for small objects.
-    Must match exactly with the training configuration.
+    
+    Args:
+        num_classes: Number of classes including background
+        mask_resolution: Final mask output resolution.
+                        Common values: 28 (default), 56, 112
+    
+    Returns:
+        Enhanced Mask R-CNN model with higher resolution masks
     """
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
     
     # Calculate ROI pooling size (typically half of final mask resolution)
-    roi_pool_size = mask_resolution // 2
+    if mask_resolution <= 56:
+        roi_pool_size = mask_resolution // 2
+    else:
+        # Cap ROI pooling size at 28 for higher resolutions to save memory
+        roi_pool_size = 28
     
     # Increase ROI pooling resolution for masks
     model.roi_heads.mask_roi_pool.output_size = (roi_pool_size, roi_pool_size)
     print(f"Mask ROI pool size set to: {roi_pool_size}×{roi_pool_size}")
     print(f"Target mask resolution: {mask_resolution}×{mask_resolution}")
     
-    # Optimize anchor generator for small objects using dynamic calculation
+    # Create custom mask predictor for higher resolution
+    class HighResMaskRCNNPredictor(nn.Module):
+        def __init__(self, in_channels, dim_reduced, num_classes, mask_size):
+            super().__init__()
+            self.mask_size = mask_size
+
+            # Reduce hidden dimension for high-resolution masks
+            if mask_size <= 56:
+                hidden_dim = dim_reduced
+            else:
+                hidden_dim = dim_reduced // 2  # 256 -> 128 for memory
+
+            # Determine number of conv layers based on resolution
+            if mask_size <= 28:
+                # Standard configuration for 28×28
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                
+            elif mask_size <= 56:
+                # Enhanced configuration for 56×56
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.conv6_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                
+            elif mask_size <= 112:
+                # Advanced configuration for 112×112
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, hidden_dim, 2, 2, 0)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.conv6_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.conv7_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
+                self.relu3 = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(hidden_dim, num_classes, 1, 1, 0)
+                
+            else:
+                raise ValueError(f"Mask resolution {mask_size} not supported. Use 28, 56, or 112.")
+            
+            # Initialize weights
+            for name, param in self.named_parameters():
+                if "weight" in name:
+                    nn.init.kaiming_normal_(param, mode="fan_out", nonlinearity="relu")
+                elif "bias" in name:
+                    nn.init.constant_(param, 0)
+        
+        def forward(self, x):
+            if self.mask_size <= 28:
+                x = self.conv5_mask(x)
+                x = self.relu(x)
+                x = self.mask_fcn_logits(x)
+                
+            elif self.mask_size <= 56:
+                x = self.conv5_mask(x)
+                x = self.relu1(x)
+                x = self.conv6_mask(x)
+                x = self.relu2(x)
+                x = self.mask_fcn_logits(x)
+                
+            elif self.mask_size <= 112:
+                x = self.relu1(self.conv5_mask(x))
+                torch.cuda.empty_cache()
+                x = self.relu2(self.conv6_mask(x))
+                torch.cuda.empty_cache()
+                x = self.relu3(self.conv7_mask(x))
+                torch.cuda.empty_cache()
+                x = self.mask_fcn_logits(x)
+            
+                # Crop to exact size if needed
+                if x.shape[-1] != self.mask_size:
+                    x = F.interpolate(x, size=(self.mask_size, self.mask_size), 
+                                    mode='bilinear', align_corners=False)
+            return x
+    
+    # Optimize anchor generator for small objects
     anchor_generator = torchvision.models.detection.anchor_utils.AnchorGenerator(
         sizes=tuple((size,) for size in get_anchor_sizes(IMG_SIZE, base_min_anchor=BASE_MIN_ANCHOR)),
         aspect_ratios=((0.5, 1.0, 2.0),) * 5  # 5 tuples for 5 feature maps
@@ -418,9 +263,7 @@ def get_model_instance_segmentation(num_classes, mask_resolution=56):
     return model
 
 def get_inference_transforms():
-    """
-    Transformations for inference (without augmentations).
-    """
+    """Transformations for inference (without augmentations)."""
     return A.Compose([
         A.LongestMaxSize(max_size=IMG_SIZE),
         A.PadIfNeeded(
@@ -438,49 +281,42 @@ class HighResMaskRCNNPredictor(torch.nn.Module):
         super().__init__()
         self.mask_size = mask_size
         
-        # Determine number of conv layers based on resolution
         if mask_size <= 28:
-            # Standard configuration for 28×28
-            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced, 
+            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced,
                                                       dim_reduced, 2, 2, 0)
             self.relu = torch.nn.ReLU(inplace=True)
-            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced, 
+            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced,
                                                   num_classes, 1, 1, 0)
         elif mask_size <= 56:
-            # Enhanced configuration for 56×56
-            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced, 
+            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced,
                                                       dim_reduced, 2, 2, 0)
             self.relu1 = torch.nn.ReLU(inplace=True)
-            self.conv6_mask = torch.nn.ConvTranspose2d(dim_reduced, 
+            self.conv6_mask = torch.nn.ConvTranspose2d(dim_reduced,
                                                       dim_reduced, 2, 2, 0)
             self.relu2 = torch.nn.ReLU(inplace=True)
-            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced, 
+            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced,
                                                   num_classes, 1, 1, 0)
         elif mask_size <= 112:
-            # Advanced configuration for 112×112
-            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced, 
+            self.conv5_mask = torch.nn.ConvTranspose2d(dim_reduced,
                                                       dim_reduced, 2, 2, 0)
             self.relu1 = torch.nn.ReLU(inplace=True)
-            self.conv6_mask = torch.nn.ConvTranspose2d(dim_reduced, 
+            self.conv6_mask = torch.nn.ConvTranspose2d(dim_reduced,
                                                       dim_reduced, 2, 2, 0)
             self.relu2 = torch.nn.ReLU(inplace=True)
-            self.conv7_mask = torch.nn.ConvTranspose2d(dim_reduced, 
+            self.conv7_mask = torch.nn.ConvTranspose2d(dim_reduced,
                                                       dim_reduced, 2, 2, 0)
             self.relu3 = torch.nn.ReLU(inplace=True)
-            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced, 
+            self.mask_fcn_logits = torch.nn.Conv2d(dim_reduced,
                                                   num_classes, 1, 1, 0)
-        else:
-            raise ValueError(f"Mask resolution {mask_size} not supported. "
-                           f"Use 28, 56, or 112.")
         
         # Initialize weights
         for name, param in self.named_parameters():
             if "weight" in name:
-                torch.nn.init.kaiming_normal_(param, mode="fan_out", 
+                torch.nn.init.kaiming_normal_(param, mode="fan_out",
                                             nonlinearity="relu")
             elif "bias" in name:
                 torch.nn.init.constant_(param, 0)
-
+    
     def forward(self, x):
         if self.mask_size <= 28:
             x = self.conv5_mask(x)
@@ -504,26 +340,10 @@ class HighResMaskRCNNPredictor(torch.nn.Module):
 
 def calculate_transformation_params(original_height, original_width,
                                   target_size=IMG_SIZE):
-    """
-    Calculates the parameters needed to reverse the LongestMaxSize +
-    PadIfNeeded transformation.
-    
-    Args:
-        original_height: Original image height
-        original_width: Original image width
-        target_size: Target size used in transformation (default: IMG_SIZE)
-    
-    Returns:
-        dict: Parameters for transformation reversal
-    """
-    # Calculate scale factor (same as LongestMaxSize)
+    """Calculate parameters for transformation reversal."""
     scale_factor = target_size / max(original_height, original_width)
-    
-    # Calculate scaled dimensions
     scaled_height = int(original_height * scale_factor)
     scaled_width = int(original_width * scale_factor)
-    
-    # Calculate padding offsets
     pad_top = (target_size - scaled_height) // 2
     pad_left = (target_size - scaled_width) // 2
     
@@ -538,35 +358,24 @@ def calculate_transformation_params(original_height, original_width,
     }
 
 def reverse_mask_transformation(mask, transform_params):
-    """
-    Reverses the LongestMaxSize + PadIfNeeded transformation on a mask.
-    
-    Args:
-        mask: Mask tensor of shape (H, W) at target_size (1024x1024)
-        transform_params: Dictionary with transformation parameters
-    
-    Returns:
-        numpy.ndarray: Mask resized to original image dimensions
-    """
-    # Convert to numpy if tensor
+    """Reverse the LongestMaxSize + PadIfNeeded transformation on a mask."""
     if torch.is_tensor(mask):
         mask_np = mask.cpu().numpy()
     else:
         mask_np = mask
     
-    # Step 1: Remove padding (crop to scaled size)
+    # Remove padding
     pad_top = transform_params['pad_top']
     pad_left = transform_params['pad_left']
     scaled_height = transform_params['scaled_height']
     scaled_width = transform_params['scaled_width']
     
-    # Crop the mask to remove padding
     cropped_mask = mask_np[
         pad_top:pad_top + scaled_height,
         pad_left:pad_left + scaled_width
     ]
     
-    # Step 2: Resize back to original size
+    # Resize back to original
     original_height = transform_params['original_height']
     original_width = transform_params['original_width']
     
@@ -578,68 +387,179 @@ def reverse_mask_transformation(mask, transform_params):
     
     return resized_mask
 
-def normalize_polygon(polygon_coords, image_height, image_width):
-    """
-    Normalizes polygon coordinates to values between 0 and 1.
-    """
-    normalized_coords = []
-    for i in range(0, len(polygon_coords), 2):
-        x = polygon_coords[i] / image_width
-        y = polygon_coords[i + 1] / image_height
-        normalized_coords.extend([x, y])
-    return normalized_coords
+# =============================================================================
+# NEW: UPDATED INFERENCE WITH FILTERING (from pruebas_masks.py)
+# =============================================================================
 
-def inference_on_image(model, image_path, transforms):
+def perform_single_inference_with_filtering(model, image_path, transforms):
     """
-    Performs inference on a specific image.
-    
-    Args:
-        model: Loaded Mask R-CNN model
-        image_path: Path to image
-        transforms: Albumentations transformations
-    
-    Returns:
-        Dictionary with inference results
+    Perform ONE inference and return filtered results.
+    Based on pruebas_masks.py algorithm.
     """
     # Load and process image
     image = cv2.imread(image_path)
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     
-    # Apply transformations
-    transformed = transforms(image=image_rgb)
-    input_tensor = transformed['image'].unsqueeze(0).to(DEVICE)
-    
-    # Inference
     model.eval()
+    transformed = transforms(image=image_rgb)
+    tensor_image = transformed['image'].unsqueeze(0).to(DEVICE)
+    
     with torch.no_grad():
-        predictions = model(input_tensor)
+        pred = model(tensor_image)[0]
     
-    # Process results
-    pred = predictions[0]
-    
-    # Filter by confidence threshold
+    # Filter by confidence
     high_conf_indices = pred['scores'] > CONFIDENCE_THRESHOLD
     
-    filtered_results = {
-        'boxes': pred['boxes'][high_conf_indices].cpu().numpy(),
-        'labels': pred['labels'][high_conf_indices].cpu().numpy(),
-        'scores': pred['scores'][high_conf_indices].cpu().numpy(),
-        'masks': pred['masks'][high_conf_indices].cpu().numpy()
-    }
+    # Get original image dimensions for area filtering
+    with Image.open(image_path) as img:
+        original_width, original_height = img.size
+    
+    transform_params = calculate_transformation_params(original_height,
+                                                     original_width)
+    
+    # Filter by mask area in original image space
+    valid_indices = []
+    for i, idx in enumerate(high_conf_indices.nonzero().flatten()):
+        mask_tensor = pred['masks'][idx]
+        current_label = CLASS_MAPPING[pred['labels'][idx].item()]
+        
+        # Transform mask to original size and check area
+        if mask_tensor.ndim == 3:
+            mask = mask_tensor[0]
+        else:
+            mask = mask_tensor
+        
+        # Apply morphological closing to fill holes
+        mask_np = mask.cpu().numpy()
+        mask_binary = (mask_np > 0.5).astype(np.uint8)
+        
+        # Fill holes using morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_filled = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel)
+        
+        # Update the mask tensor with filled version
+        pred['masks'][idx] = torch.from_numpy(
+            mask_filled.astype(np.float32)
+        ).unsqueeze(0)
+        
+        # Transform to original size and check area
+        mask_original = reverse_mask_transformation(mask_filled,
+                                                  transform_params)
+        original_area = np.sum(mask_original > 0.5)
+        
+        if original_area >= MIN_MASK_AREA_ORIGINAL[current_label]:
+            valid_indices.append(idx.item())
+    
+    # Create filtered results
+    if valid_indices:
+        valid_indices = torch.tensor(valid_indices,
+                                   device=pred['masks'].device)
+        filtered_results = {
+            'boxes': pred['boxes'][valid_indices].cpu().numpy(),
+            'labels': pred['labels'][valid_indices].cpu().numpy(),
+            'scores': pred['scores'][valid_indices].cpu().numpy(),
+            'masks': pred['masks'][valid_indices].cpu().numpy()
+        }
+    else:
+        filtered_results = {
+            'boxes': np.array([]),
+            'labels': np.array([]),
+            'scores': np.array([]),
+            'masks': np.array([])
+        }
     
     return filtered_results
+
+# =============================================================================
+# NEW: COORDINATE TRANSFORMATION FUNCTION (from pruebas_masks.py)
+# =============================================================================
+
+def transform_inference_point_to_original(x_inf, y_inf, transform_params):
+    """Transform point from inference space back to original image space."""
+    # Remove padding
+    x_scaled = x_inf - transform_params['pad_left']
+    y_scaled = y_inf - transform_params['pad_top']
     
+    # Scale back to original size
+    original_x = x_scaled / transform_params['scale_factor']
+    original_y = y_scaled / transform_params['scale_factor']
+    
+    return original_x, original_y
+
+# =============================================================================
+# NEW: UPDATED POLYGON EXTRACTION (from pruebas_masks.py)
+# =============================================================================
+
+def extract_polygon(mask_tensor, transform_params, min_mask_pixels=20):
+    """
+    Extract polygon WITHOUT simplification - just use raw contour points.
+    Based on pruebas_masks.py algorithm.
+    """
+    if torch.is_tensor(mask_tensor):
+        mask = mask_tensor.cpu().numpy()
+    else:
+        mask = mask_tensor
+    
+    if mask.ndim == 3:
+        mask = mask[0]
+    
+    # Check if mask is too small
+    mask_binary = mask > 0.5
+    total_pixels = np.sum(mask_binary)
+    
+    if total_pixels < min_mask_pixels:
+        return [], f"Mask too small: {total_pixels} pixels"
+    
+    # Convert to uint8
+    mask_uint8 = (mask * 255).astype(np.uint8)
+    
+    # Find contours with CHAIN_APPROX_SIMPLE (changed from CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(
+        mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    
+    if not contours:
+        return [], "No contours found"
+    
+    # Select largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # NO SIMPLIFICATION - just subsample if too many points
+    if len(largest_contour) > 50:  # Only limit if excessive
+        step = len(largest_contour) // 50
+        working_contour = largest_contour[::step]
+    else:
+        working_contour = largest_contour  # Use all points
+    
+    # Convert to normalized coordinates
+    polygon_coords = []
+    for point in working_contour:
+        x_inf, y_inf = point[0]
+        
+        # Transform coordinates
+        original_x, original_y = transform_inference_point_to_original(
+            x_inf, y_inf, transform_params
+        )
+        
+        # Validate coordinates
+        if (0 <= original_x < transform_params['original_width'] and
+                0 <= original_y < transform_params['original_height']):
+            norm_x = original_x / transform_params['original_width']
+            norm_y = original_y / transform_params['original_height']
+            polygon_coords.extend([norm_x, norm_y])
+    
+    if len(polygon_coords) < 6:
+        return [], f"Too few valid points: {len(polygon_coords)//2}"
+    
+    return polygon_coords, "SUCCESS"
+
+# =============================================================================
+# UPDATED CONVERSION FUNCTIONS
+# =============================================================================
 
 def convert_to_yolo_format(predictions, original_size):
     """
-    Converts Mask R-CNN predictions to YoloV11 format using custom simplification.
-    
-    Args:
-        predictions: Dictionary with inference results
-        original_size: Tuple (height, width) of original size
-    
-    Returns:
-        List of strings in YoloV11 format
+    Convert Mask R-CNN predictions to YoloV11 format using new algorithm.
     """
     yolo_annotations = []
     original_height, original_width = original_size
@@ -654,7 +574,7 @@ def convert_to_yolo_format(predictions, original_size):
     scores = predictions['scores']
     
     for i in range(len(masks)):
-        mask = masks[i][0]  # Take the first channel of the mask
+        mask = masks[i]
         label = labels[i]
         score = scores[i]
         
@@ -664,20 +584,12 @@ def convert_to_yolo_format(predictions, original_size):
         else:
             continue  # Skip if class is not mapped
         
-        # Properly reverse the transformation
-        mask_original = reverse_mask_transformation(mask, transform_params)
-        
-        # Convert mask to polygon using custom simplification
-        polygon_coords = mask_to_polygon(
-            mask_original,
-            image_dimensions=(original_width, original_height),
-            min_area=MIN_CONTOUR_AREA,
-            simplification_tolerance=SIMPLIFICATION_TOLERANCE,
-            enable_simplification=ENABLE_SIMPLIFICATION,
-            min_polygon_points=MIN_POLYGON_POINTS
+        # Extract polygon using new method (no simplification)
+        polygon_coords, status = extract_polygon(
+            mask, transform_params, MIN_CONTOUR_AREA
         )
         
-        if len(polygon_coords) < 6:  # Need at least 3 points (6 coordinates)
+        if status != "SUCCESS" or len(polygon_coords) < 6:
             continue
         
         # Format for YoloV11
@@ -689,19 +601,7 @@ def convert_to_yolo_format(predictions, original_size):
 
 def create_mask_overlay(image, predictions, original_size,
                        alpha: float = 0.6) -> np.ndarray:
-    """
-    Creates a transparent overlay of predicted masks on the original image.
-    
-    Args:
-        image: Original image as numpy array (H, W, 3)
-        predictions: Dictionary with inference results
-        original_size: Tuple (height, width) of original size
-        alpha: Transparency level for mask overlay (0.0 to 1.0)
-    
-    Returns:
-        np.ndarray: Image with transparent mask overlays
-    """
-    # Create a copy of the original image
+    """Create transparent overlay of predicted masks on original image."""
     result_image = image.copy()
     original_height, original_width = original_size
     
@@ -722,7 +622,11 @@ def create_mask_overlay(image, predictions, original_size,
     
     # Process each mask
     for i in range(len(masks)):
-        mask = masks[i][0]  # Take the first channel
+        if masks[i].ndim == 3:
+            mask = masks[i][0]  # Take the first channel
+        else:
+            mask = masks[i]
+        
         label = labels[i]
         
         # Map class if necessary
@@ -759,19 +663,7 @@ def create_mask_overlay(image, predictions, original_size,
 def save_visualization(image_path: str, predictions: dict,
                       original_size: tuple, output_path: str,
                       alpha: float = 0.6) -> None:
-    """
-    Saves an image with transparent mask overlays only.
-    
-    Args:
-        image_path: Path to the original image
-        predictions: Dictionary with inference results
-        original_size: Tuple (height, width) of original size
-        output_path: Path where to save the visualization
-        alpha: Transparency level (0.0 = invisible, 1.0 = opaque)
-    
-    Returns:
-        None
-    """
+    """Save image with transparent mask overlays."""
     # Load original image
     original_image = cv2.imread(image_path)
     
@@ -784,13 +676,11 @@ def save_visualization(image_path: str, predictions: dict,
     cv2.imwrite(output_path, overlay_image)
 
 # =============================================================================
-# MAIN FUNCTION WITH ENHANCED ARGUMENT SUPPORT
+# MAIN FUNCTION WITH UPDATED ALGORITHM
 # =============================================================================
 
 def main():
-    """
-    Main function with enhanced simplification control options.
-    """
+    """Main function with updated mask processing algorithm."""
     # Parse command-line arguments
     args = parse_arguments()
     
@@ -800,9 +690,7 @@ def main():
     print(f"Using device: {DEVICE}")
     print(f"Model path: {MODEL_PATH}")
     print(f"Using class mapping: {CLASS_MAPPING}")
-    print(f"Simplification enabled: {ENABLE_SIMPLIFICATION}")
-    print(f"Simplification tolerance: {SIMPLIFICATION_TOLERANCE}")
-    print(f"Minimum polygon points: {MIN_POLYGON_POINTS}")
+    print(f"Class-specific area thresholds: {MIN_MASK_AREA_ORIGINAL}")
     print(f"Minimum contour area: {MIN_CONTOUR_AREA}")
     print(f"Input images folder: {INPUT_IMAGES_FOLDER}")
     print(f"Output labels folder: {OUTPUT_LABELS_FOLDER}")
@@ -834,15 +722,15 @@ def main():
             # Get original image size
             with Image.open(image_path) as img:
                 original_width, original_height = img.size
-            original_size = (original_height, original_width)
+                original_size = (original_height, original_width)
             
             try:
-                # Perform inference
-                predictions, _ = inference_on_image(
+                # Perform inference with filtering (NEW METHOD)
+                predictions = perform_single_inference_with_filtering(
                     model, image_path, transforms
                 )
                 
-                # Convert to YoloV11 format with enhanced control
+                # Convert to YoloV11 format with new algorithm
                 yolo_annotations = convert_to_yolo_format(
                     predictions, original_size
                 )
@@ -865,7 +753,7 @@ def main():
                     predictions,
                     original_size,
                     output_image_path,
-                    alpha=0.4  # Adjust transparency level (0.0-1.0)
+                    alpha=0.4
                 )
                 
                 processed_count += 1

@@ -760,7 +760,11 @@ def get_model_instance_segmentation(num_classes, mask_resolution=28):
     model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
     
     # Calculate ROI pooling size (typically half of final mask resolution)
-    roi_pool_size = mask_resolution // 2
+    if mask_resolution <= 56:
+        roi_pool_size = mask_resolution // 2
+    else:
+        # Cap ROI pooling size at 28 for higher resolutions to save memory
+        roi_pool_size = 28
     
     # Increase ROI pooling resolution for masks
     model.roi_heads.mask_roi_pool.output_size = (roi_pool_size, roi_pool_size)
@@ -772,7 +776,13 @@ def get_model_instance_segmentation(num_classes, mask_resolution=28):
         def __init__(self, in_channels, dim_reduced, num_classes, mask_size):
             super().__init__()
             self.mask_size = mask_size
-            
+
+            # Reduce hidden dimension for high-resolution masks
+            if mask_size <= 56:
+                hidden_dim = dim_reduced
+            else:
+                hidden_dim = dim_reduced // 2  # 256 -> 128 for memory
+
             # Determine number of conv layers based on resolution
             if mask_size <= 28:
                 # Standard configuration for 28×28
@@ -790,13 +800,13 @@ def get_model_instance_segmentation(num_classes, mask_resolution=28):
                 
             elif mask_size <= 112:
                 # Advanced configuration for 112×112
-                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, hidden_dim, 2, 2, 0)
                 self.relu1 = nn.ReLU(inplace=True)
-                self.conv6_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.conv6_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
                 self.relu2 = nn.ReLU(inplace=True)
-                self.conv7_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.conv7_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
                 self.relu3 = nn.ReLU(inplace=True)
-                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                self.mask_fcn_logits = nn.Conv2d(hidden_dim, num_classes, 1, 1, 0)
                 
             else:
                 raise ValueError(f"Mask resolution {mask_size} not supported. Use 28, 56, or 112.")
@@ -822,14 +832,18 @@ def get_model_instance_segmentation(num_classes, mask_resolution=28):
                 x = self.mask_fcn_logits(x)
                 
             elif self.mask_size <= 112:
-                x = self.conv5_mask(x)
-                x = self.relu1(x)
-                x = self.conv6_mask(x)
-                x = self.relu2(x)
-                x = self.conv7_mask(x)
-                x = self.relu3(x)
+                x = self.relu1(self.conv5_mask(x))
+                torch.cuda.empty_cache()
+                x = self.relu2(self.conv6_mask(x))
+                torch.cuda.empty_cache()
+                x = self.relu3(self.conv7_mask(x))
+                torch.cuda.empty_cache()
                 x = self.mask_fcn_logits(x)
             
+                # Crop to exact size if needed
+                if x.shape[-1] != self.mask_size:
+                    x = F.interpolate(x, size=(self.mask_size, self.mask_size), 
+                                    mode='bilinear', align_corners=False)
             return x
     
     # Optimize anchor generator for small objects
@@ -1386,7 +1400,7 @@ def save_inference_examples(model, output_path):
             with Image.open(test_image_path) as img:
                 test_original_size = (img.height, img.width)
             
-            test_predictions, _ = inference_on_image(
+            test_predictions = inference_on_image(
                 model, test_image_path, transforms
             )
             

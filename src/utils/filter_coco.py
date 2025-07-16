@@ -276,7 +276,18 @@ def main() -> None:
     # Path to the original COCO annotation file (automatically detected)
     original_coco_dir = os.path.join(dataset_path, 'original_coco')
     try:
-        original_annotation_file = find_coco_annotation_file(original_coco_dir)
+        try:
+            # Try to find annotation file in original_coco_dir
+            original_annotation_file = find_coco_annotation_file(
+                original_coco_dir
+            )
+        except FileNotFoundError:
+            # Try to find annotation file in original_coco/train/
+            alt_coco_dir = os.path.join(original_coco_dir, 'train')
+            original_annotation_file = find_coco_annotation_file(
+                alt_coco_dir
+            )
+            original_coco_dir = alt_coco_dir  # Update to new working dir
     except FileNotFoundError as e:
         print(f"ERROR: {e}")
         return

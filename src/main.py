@@ -39,7 +39,7 @@ TARGET_CLASSES_FOR_REPLACEMENT = [0, 1]
 # =============================================================================
 
 # Base model name - will be updated to ensure uniqueness
-BASE_MODEL_NAME = "m01"
+BASE_MODEL_NAME = "m02"
 NUM_CLASSES = len(CLASSES_TO_KEEP) + 1 # +1 for background class
 
 # Training parameters
@@ -49,7 +49,7 @@ LEARNING_RATE = 0.0001
 IMG_SIZE = 2048
 CONFIDENCE_THRESHOLD = 0.3
 DICE_WEIGHT = 0.0
-MASK_RESOLUTION = 56
+MASK_RESOLUTION = 112
 BASE_MIN_ANCHOR = 16
 
 # Training options
@@ -58,8 +58,8 @@ OVERSAMPLE_SMALL_OBJECTS = True
 USE_COPY_PASTE = True
 
 # RPN parameters
-RPN_PRE_NMS_TOP_N_TRAIN = 1500
-RPN_POST_NMS_TOP_N_TRAIN = 600
+RPN_PRE_NMS_TOP_N_TRAIN = 400
+RPN_POST_NMS_TOP_N_TRAIN = 150
 RPN_NMS_THRESH = 0.6
 
 # Output configuration
@@ -75,10 +75,7 @@ OUTPUT_IMAGES_FOLDER = "dataset/inference/images"
 # =============================================================================
 
 # Polygon conversion parameters
-MIN_CONTOUR_AREA = 50                    # Minimum contour area to consider
-SIMPLIFICATION_TOLERANCE = 1.4          # Tolerance for polygon simplification
-ENABLE_SIMPLIFICATION = False           # Enable/disable polygon simplification
-MIN_POLYGON_POINTS = 25                 # Minimum number of points to maintain in polygon
+MIN_CONTOUR_AREA = 50                   # Minimum contour area to consider
 
 # =============================================================================
 # LABEL COMBINATION CONFIGURATION
@@ -257,12 +254,6 @@ def run_coco2yolo(model_path):
     print(f"Using model: {model_path}")
     print(f"Class mapping: {COCO_TO_YOLO_CLASS_MAPPING}")
     
-    # Print polygon simplification configuration
-    print(f"Polygon simplification enabled: {ENABLE_SIMPLIFICATION}")
-    print(f"Simplification tolerance: {SIMPLIFICATION_TOLERANCE}")
-    print(f"Minimum polygon points: {MIN_POLYGON_POINTS}")
-    print(f"Minimum contour area: {MIN_CONTOUR_AREA}")
-    
     try:
         # Build command with all inference parameters
         cmd = [
@@ -280,15 +271,7 @@ def run_coco2yolo(model_path):
             "--class_mapping", json.dumps(COCO_TO_YOLO_CLASS_MAPPING),
             # Pass polygon simplification configuration
             "--min_contour_area", str(MIN_CONTOUR_AREA),
-            "--simplification_tolerance", str(SIMPLIFICATION_TOLERANCE),
-            "--min_polygon_points", str(MIN_POLYGON_POINTS)
         ]
-        
-        # Add simplification enable/disable flag
-        if ENABLE_SIMPLIFICATION:
-            cmd.append("--enable_simplification")
-        else:
-            cmd.append("--disable_simplification")
         
         print(f"Running COCO to YOLO conversion with {len(cmd)} parameters...")
         result = subprocess.run(cmd, check=True)
@@ -370,9 +353,6 @@ def print_pipeline_summary():
     print("\n" + "-"*40)
     print("POLYGON SIMPLIFICATION CONFIGURATION")
     print("-"*40)
-    print(f"Enable Simplification: {ENABLE_SIMPLIFICATION}")
-    print(f"Simplification Tolerance: {SIMPLIFICATION_TOLERANCE}")
-    print(f"Minimum Polygon Points: {MIN_POLYGON_POINTS}")
     print(f"Minimum Contour Area: {MIN_CONTOUR_AREA}")
     print("="*80)
 
@@ -391,15 +371,15 @@ def main():
     
     try:
         run_filter_coco()
-        run_training(model_path)      # Pass the finalized model path
-        run_coco2yolo(model_path)     # Use the same model path
+        run_training(model_path)
+        run_coco2yolo(model_path)
         run_adapt2rbf()
         
         pipeline_end_time = datetime.now()
         duration = pipeline_end_time - pipeline_start_time
         
         print("\n" + "="*80)
-        print("🎉 COMPLETE PIPELINE FINISHED SUCCESSFULLY! 🎉")
+        print("!!!COMPLETE PIPELINE FINISHED SUCCESSFULLY!!!")
         print("="*80)
         print(f"Total duration: {str(duration).split('.')[0]}")
         print(f"Model saved at: {model_path}")
