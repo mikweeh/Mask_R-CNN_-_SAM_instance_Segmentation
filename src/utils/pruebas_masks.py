@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+
 """
 Debug script with individual mask visualization for detailed analysis.
 """
 
+
 import os
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
@@ -20,24 +24,28 @@ import matplotlib.patches as patches
 import json
 import argparse
 
+
 # =============================================================================
 # CONFIGURATION - COPY FROM YOUR SCRIPTS
 # =============================================================================
 
+
 # Default paths and parameters (matching your scripts)
-MODEL_PATH = 'weights/m01_4.pth'
+MODEL_PATH = 'weights/m02.pth'
 DATASET_PATH = "dataset"
 TEST_IMAGES_PATH = os.path.join(DATASET_PATH, "valid")
 IMG_SIZE = 2048
 CONFIDENCE_THRESHOLD = 0.3
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-MASK_RESOLUTION = 56
+MASK_RESOLUTION = 112
 BASE_MIN_ANCHOR = 16
 NUM_CLASSES = 3
+
 
 # Class configuration
 CLASS_MAPPING = {1: 0, 2: 1}
 CLASS_NAMES = {0: "Chromis chromis", 1: "Coris julis"}
+
 
 # Polygon parameters
 MIN_MASK_AREA_ORIGINAL = [256, 100]  # Minimum area in original image pixels (256 for chromis and 100 for coris)
@@ -45,17 +53,23 @@ MIN_CONTOUR_AREA = 64  # Minimum number of pixels in the mask area in inference 
 SIMPLIFICATION_TOLERANCE = 1.4
 ENABLE_SIMPLIFICATION = False
 
+
 # Debug configuration
-SHOW_INDIVIDUAL_MASKS = False  # Set to False to disable individual mask display
+SHOW_INDIVIDUAL_MASKS = True  # Set to False to disable individual mask display
 PAUSE_FOR_EACH_MASK = False   # Pause to see each mask
 ENABLE_DETAILED_DEBUG = True   # Print detailed debugging info
 
+
 # Output configuration
-OUTPUT_PATH = "results/debug2"
+OUTPUT_PATH = "results/debug3"
+GENERATE_PDF = True  # Control PDF generation
+SAVE_JSON = False     # Control JSON saving
+
 
 # =============================================================================
 # MODEL AND TRANSFORMATION FUNCTIONS (SAME AS BEFORE)
 # =============================================================================
+
 
 def get_anchor_sizes(img_size, base_img_size=1280, base_min_anchor=16):
     """Calculate anchor sizes maintaining powers-of-2 progression."""
@@ -63,6 +77,7 @@ def get_anchor_sizes(img_size, base_img_size=1280, base_min_anchor=16):
     min_anchor = int(round(base_min_anchor * scale_factor))
     anchor_sizes = tuple(min_anchor * (2**i) for i in range(5))
     return anchor_sizes
+
 
 class HighResMaskRCNNPredictor(torch.nn.Module):
     """High resolution mask predictor for Mask R-CNN."""
@@ -127,35 +142,131 @@ class HighResMaskRCNNPredictor(torch.nn.Module):
             x = self.mask_fcn_logits(x)
         return x
 
-def get_model_instance_segmentation(num_classes, mask_resolution=56):
-    """Creates Mask R-CNN model matching the training configuration."""
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(
-        weights="DEFAULT"
-    )
+
+def get_model_instance_segmentation(num_classes, mask_resolution=28):
+    """
+    Creates Mask R-CNN model with customizable mask resolution for small objects.
     
-    # Configure ROI pooling
-    roi_pool_size = mask_resolution // 2
+    Args:
+        num_classes: Number of classes including background
+        mask_resolution: Final mask output resolution.
+                        Common values: 28 (default), 56, 112
+    
+    Returns:
+        Enhanced Mask R-CNN model with higher resolution masks
+    """
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights="DEFAULT")
+    
+    # Calculate ROI pooling size (typically half of final mask resolution)
+    if mask_resolution <= 56:
+        roi_pool_size = mask_resolution // 2
+    else:
+        # Cap ROI pooling size at 28 for higher resolutions to save memory
+        roi_pool_size = 28
+    
+    # Increase ROI pooling resolution for masks
     model.roi_heads.mask_roi_pool.output_size = (roi_pool_size, roi_pool_size)
+    print(f"Mask ROI pool size set to: {roi_pool_size}×{roi_pool_size}")
+    print(f"Target mask resolution: {mask_resolution}×{mask_resolution}")
     
-    # Configure anchor generator
+    # Create custom mask predictor for higher resolution
+    class HighResMaskRCNNPredictor(nn.Module):
+        def __init__(self, in_channels, dim_reduced, num_classes, mask_size):
+            super().__init__()
+            self.mask_size = mask_size
+
+
+            # Reduce hidden dimension for high-resolution masks
+            if mask_size <= 56:
+                hidden_dim = dim_reduced
+            else:
+                hidden_dim = dim_reduced // 2  # 256 -> 128 for memory
+
+
+            # Determine number of conv layers based on resolution
+            if mask_size <= 28:
+                # Standard configuration for 28×28
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                
+            elif mask_size <= 56:
+                # Enhanced configuration for 56×56
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.conv6_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
+                
+            elif mask_size <= 112:
+                # Advanced configuration for 112×112
+                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, hidden_dim, 2, 2, 0)
+                self.relu1 = nn.ReLU(inplace=True)
+                self.conv6_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
+                self.relu2 = nn.ReLU(inplace=True)
+                self.conv7_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
+                self.relu3 = nn.ReLU(inplace=True)
+                self.mask_fcn_logits = nn.Conv2d(hidden_dim, num_classes, 1, 1, 0)
+                
+            else:
+                raise ValueError(f"Mask resolution {mask_size} not supported. Use 28, 56, or 112.")
+            
+            # Initialize weights
+            for name, param in self.named_parameters():
+                if "weight" in name:
+                    nn.init.kaiming_normal_(param, mode="fan_out", nonlinearity="relu")
+                elif "bias" in name:
+                    nn.init.constant_(param, 0)
+        
+        def forward(self, x):
+            if self.mask_size <= 28:
+                x = self.conv5_mask(x)
+                x = self.relu(x)
+                x = self.mask_fcn_logits(x)
+                
+            elif self.mask_size <= 56:
+                x = self.conv5_mask(x)
+                x = self.relu1(x)
+                x = self.conv6_mask(x)
+                x = self.relu2(x)
+                x = self.mask_fcn_logits(x)
+                
+            elif self.mask_size <= 112:
+                x = self.relu1(self.conv5_mask(x))
+                torch.cuda.empty_cache()
+                x = self.relu2(self.conv6_mask(x))
+                torch.cuda.empty_cache()
+                x = self.relu3(self.conv7_mask(x))
+                torch.cuda.empty_cache()
+                x = self.mask_fcn_logits(x)
+            
+                # Crop to exact size if needed
+                if x.shape[-1] != self.mask_size:
+                    x = F.interpolate(x, size=(self.mask_size, self.mask_size), 
+                                    mode='bilinear', align_corners=False)
+            return x
+    
+    # Optimize anchor generator for small objects
     anchor_generator = torchvision.models.detection.anchor_utils.AnchorGenerator(
-        sizes=tuple((size,) for size in get_anchor_sizes(IMG_SIZE, 
-                                                         base_min_anchor=BASE_MIN_ANCHOR)),
-        aspect_ratios=((0.5, 1.0, 2.0),) * 5
+        sizes=tuple((size,) for size in get_anchor_sizes(IMG_SIZE, base_min_anchor=BASE_MIN_ANCHOR)),
+        aspect_ratios=((0.5, 1.0, 2.0),) * 5  # 5 tuples for 5 feature maps
     )
     model.rpn.anchor_generator = anchor_generator
     
-    # Replace predictors
+    # Replace box predictor
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     
+    # Replace mask predictor with high-resolution version
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
     model.roi_heads.mask_predictor = HighResMaskRCNNPredictor(
         in_features_mask, hidden_layer, num_classes, mask_resolution
     )
     
+    print(f"Model configured for {mask_resolution}×{mask_resolution} masks")
     return model
+
 
 def get_inference_transforms():
     """Get transforms for inference."""
@@ -170,6 +281,7 @@ def get_inference_transforms():
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
+
 
 def calculate_transformation_params(original_height, original_width, 
                                     target_size=IMG_SIZE):
@@ -189,6 +301,7 @@ def calculate_transformation_params(original_height, original_width,
         'original_height': original_height,
         'original_width': original_width
     }
+
 
 def reverse_mask_transformation(mask, transform_params):
     """Reverse the transformation applied to masks."""
@@ -220,9 +333,11 @@ def reverse_mask_transformation(mask, transform_params):
     
     return resized_mask
 
+
 # =============================================================================
 # SINGLE INFERENCE FUNCTION WITH FILTERING
 # =============================================================================
+
 
 def perform_single_inference_with_filtering(model, image_path, transforms):
     """Perform ONE inference and return filtered results."""
@@ -300,13 +415,15 @@ def perform_single_inference_with_filtering(model, image_path, transforms):
     
     return filtered_results
 
+
 # =============================================================================
 # INDIVIDUAL MASK VISUALIZATION FUNCTION
 # =============================================================================
 
+
 def visualize_individual_mask(mask_id, original_image, mask_tensor, label, score, 
                               transform_params, polygon_coords=None, 
-                              polygon_status=""):
+                              polygon_status="", save_path=None):
     """Visualize individual mask with detailed information."""
     
     # Extract mask
@@ -372,11 +489,8 @@ def visualize_individual_mask(mask_id, original_image, mask_tensor, label, score
     axes[2].set_title(f'Binary Mask\nSize: {mask_width}x{mask_height}')
     axes[2].axis('off')
     
-    # 4. Polygon visualization (if available)
+    # 4. Polygon visualization (if available) - MODIFIED TO SHOW CONTOUR LINES
     if polygon_coords and len(polygon_coords) >= 6:
-        # Draw polygon on mask
-        polygon_img = np.zeros_like(mask_crop, dtype=np.uint8)
-        
         # Convert normalized polygon coords to crop coordinates
         points = []
         for i in range(0, len(polygon_coords), 2):
@@ -394,12 +508,14 @@ def visualize_individual_mask(mask_id, original_image, mask_tensor, label, score
         
         if len(points) >= 3:
             points_array = np.array(points, dtype=np.int32)
-            cv2.fillPoly(polygon_img, [points_array], 255)
             
-            # Show comparison
+            # Create RGB comparison image
             comparison = np.zeros((mask_crop.shape[0], mask_crop.shape[1], 3), dtype=np.uint8)
             comparison[:, :, 0] = mask_crop.astype(np.uint8) * 255  # Original mask in red
-            comparison[:, :, 1] = polygon_img  # Polygon in green
+            
+            # Draw polygon contour lines instead of filled polygon
+            cv2.polylines(comparison, [points_array], isClosed=True, 
+                         color=(255, 255, 0), thickness=0)
             
             axes[3].imshow(comparison)
             axes[3].set_title(f'Polygon Comparison\n{len(polygon_coords)//2} points\n{polygon_status}')
@@ -415,14 +531,23 @@ def visualize_individual_mask(mask_id, original_image, mask_tensor, label, score
     axes[3].axis('off')
     
     plt.tight_layout()
+    
+    # Save the visualization if save_path is provided
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved visualization: {save_path}")
+    
     plt.show()
     
     if PAUSE_FOR_EACH_MASK:
         input(f"Press Enter to continue to next mask... (Mask {mask_id} done)")
 
+
+
 # =============================================================================
 # POLYGON CONVERSION FUNCTIONS
 # =============================================================================
+
 
 def extract_polygon(mask_tensor, transform_params, min_mask_pixels=20):
     """Extract polygon WITHOUT simplification - just use raw contour points."""
@@ -491,6 +616,7 @@ def extract_polygon(mask_tensor, transform_params, min_mask_pixels=20):
     
     return polygon_coords, "SUCCESS"
 
+
 def transform_inference_point_to_original(x_inf, y_inf, transform_params):
     """Transform point from inference space back to original image space."""
     # Remove padding
@@ -502,6 +628,7 @@ def transform_inference_point_to_original(x_inf, y_inf, transform_params):
     original_y = y_scaled / transform_params['scale_factor']
     
     return original_x, original_y
+
 
 def polygon_to_mask_robust(polygon_coords, image_dimensions):
     """Robust polygon to mask conversion with validation."""
@@ -540,9 +667,179 @@ def polygon_to_mask_robust(polygon_coords, image_dimensions):
     
     return mask.astype(np.float32) / 255.0
 
+
+# =============================================================================
+# PDF GENERATION FUNCTION
+# =============================================================================
+
+
+def create_comprehensive_pdf_report(output_path, all_results):
+    """
+    Create comprehensive PDF report for all processed images.
+    
+    Args:
+        output_path (str): Path where PDF will be saved
+        all_results (list): List of dictionaries containing results for each image
+    
+    Returns:
+        str: Path to created PDF file
+    """
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportlabImage, PageBreak
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+    except ImportError:
+        print("Error: reportlab package not installed. Install with: pip install reportlab")
+        return None
+    
+    pdf_path = os.path.join(output_path, "complete_segmentation_report.pdf")
+    doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+    
+    # Title
+    story.append(Paragraph("<b>Complete Segmentation Analysis Report</b>", styles['Title']))
+    story.append(Spacer(1, 12))
+    
+    # Overall summary statistics
+    total_images = len(all_results)
+    total_masks = sum(len(result['polygon_info']) for result in all_results)
+    total_successful = sum(sum(1 for info in result['polygon_info'] 
+                              if info['status'] == 'SUCCESS') for result in all_results)
+    total_failed = total_masks - total_successful
+    
+    story.append(Paragraph("<b>Overall Summary Statistics</b>", styles['Heading2']))
+    story.append(Paragraph(f"• Total images processed: {total_images}", 
+                          styles['Normal']))
+    story.append(Paragraph(f"• Total masks processed: {total_masks}", 
+                          styles['Normal']))
+    story.append(Paragraph(f"• Successful conversions: {total_successful}", 
+                          styles['Normal']))
+    story.append(Paragraph(f"• Failed conversions: {total_failed}", 
+                          styles['Normal']))
+    story.append(Paragraph(f"• Overall success rate: {(total_successful/total_masks*100):.1f}%" 
+                          if total_masks > 0 else "• Overall success rate: 0%", 
+                          styles['Normal']))
+    story.append(Spacer(1, 20))
+    
+    # Process each image
+    for result_idx, result in enumerate(all_results):
+        image_file = result['image_file']
+        polygon_info = result['polygon_info']
+        original_image_path = result['original_image_path']
+        
+        # Add page break between images (except for the first one)
+        if result_idx > 0:
+            story.append(PageBreak())
+        
+        # Image-specific title
+        story.append(Paragraph(f"<b>Image {result_idx + 1}: {image_file}</b>", 
+                              styles['Heading1']))
+        story.append(Spacer(1, 12))
+        
+        # Image-specific summary
+        total_masks_image = len(polygon_info)
+        successful_image = sum(1 for info in polygon_info 
+                              if info['status'] == 'SUCCESS')
+        failed_image = total_masks_image - successful_image
+        
+        story.append(Paragraph("<b>Image Summary</b>", styles['Heading2']))
+        story.append(Paragraph(f"• Masks processed: {total_masks_image}", 
+                              styles['Normal']))
+        story.append(Paragraph(f"• Successful conversions: {successful_image}", 
+                              styles['Normal']))
+        story.append(Paragraph(f"• Failed conversions: {failed_image}", 
+                              styles['Normal']))
+        story.append(Paragraph(f"• Success rate: {(successful_image/total_masks_image*100):.1f}%" 
+                              if total_masks_image > 0 else "• Success rate: 0%", 
+                              styles['Normal']))
+        story.append(Spacer(1, 12))
+        
+        # Add original image (bigger size)
+        if os.path.exists(original_image_path):
+            try:
+                story.append(Paragraph("<b>Original Image</b>", styles['Heading2']))
+                img = ReportlabImage(original_image_path)
+                img._restrictSize(7*inch, 7*inch)  # Increased from 6*inch
+                story.append(img)
+                story.append(Spacer(1, 12))
+            except Exception as e:
+                story.append(Paragraph(f"Error adding original image: {str(e)}", 
+                                     styles['Normal']))
+        
+        # Individual mask analysis
+        if polygon_info:
+            story.append(Paragraph("<b>Individual Mask Analysis</b>", 
+                                  styles['Heading2']))
+            story.append(Spacer(1, 12))
+            
+            for info in polygon_info:
+                story.append(Paragraph(f"<b>Mask {info['mask_id']}: {info['status']}</b>", 
+                                      styles['Heading3']))
+                
+                if info['status'] == 'SUCCESS':
+                    story.append(Paragraph(f"• Polygon points: {info['polygon_points']}", 
+                                          styles['Normal']))
+                    story.append(Paragraph(f"• Original size: "
+                                          f"{info['mask_width_original']}x"
+                                          f"{info['mask_height_original']} pixels", 
+                                          styles['Normal']))
+                    story.append(Paragraph(f"• Area retention: "
+                                          f"{info['area_retention']:.1f}%", 
+                                          styles['Normal']))
+                    story.append(Spacer(1, 6))
+                    
+                    # Add mask visualization (much bigger size)
+                    mask_img_path = os.path.join(output_path, 
+                                               f"{image_file}_mask_{info['mask_id']}.png")
+                    if os.path.exists(mask_img_path):
+                        try:
+                            img = ReportlabImage(mask_img_path)
+                            img._restrictSize(7.5*inch, 4*inch)  # Increased from 5*inch, 3*inch
+                            story.append(img)
+                            story.append(Spacer(1, 12))
+                        except Exception as e:
+                            story.append(Paragraph(f"Error adding mask image: {str(e)}", 
+                                                 styles['Normal']))
+                else:
+                    story.append(Paragraph(f"• Failure reason: {info['status']}", 
+                                         styles['Normal']))
+                
+                story.append(Spacer(1, 12))
+    
+    # Build PDF
+    doc.build(story)
+    return pdf_path
+
+
+# =============================================================================
+# JSON SAVING FUNCTION
+# =============================================================================
+
+
+def save_results_json(image_file, polygon_info, predictions, output_path):
+    """Save results in JSON format for further analysis."""
+    json_path = os.path.join(output_path, f"{image_file}_results.json")
+    
+    results = {
+        'image_file': image_file,
+        'total_masks': len(polygon_info),
+        'successful_conversions': sum(1 for info in polygon_info if info['status'] == 'SUCCESS'),
+        'masks': polygon_info
+    }
+    
+    with open(json_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"JSON results saved: {json_path}")
+    return json_path
+
+
 # =============================================================================
 # MAIN COMPARISON FUNCTION WITH DETAILED DEBUGGING
 # =============================================================================
+
 
 def compare_all_test_images(model_path, test_images_path, output_path):
     """Compare mask processing with detailed individual mask analysis."""
@@ -569,6 +866,9 @@ def compare_all_test_images(model_path, test_images_path, output_path):
     
     # Get transforms
     transforms = get_inference_transforms()
+    
+    # Store results for all images
+    all_results = []
     
     # Process each image
     for idx, image_file in enumerate(test_images):
@@ -599,6 +899,7 @@ def compare_all_test_images(model_path, test_images_path, output_path):
         
         # Process each mask individually
         polygon_info = []
+        temp_image_paths = []  # Track temporary image paths for cleanup
         
         for i in range(len(predictions['masks'])):
             mask_tensor = predictions['masks'][i]
@@ -623,7 +924,6 @@ def compare_all_test_images(model_path, test_images_path, output_path):
             
             print(f"Polygon extraction: {status}")
             if status == "SUCCESS":
-
                 # Calculate area retention
                 original_mask_transformed = reverse_mask_transformation(
                     mask_tensor[0] if mask_tensor.ndim == 3 else mask_tensor, 
@@ -680,13 +980,29 @@ def compare_all_test_images(model_path, test_images_path, output_path):
                     'polygon_points': 0
                 })
             
-            # Show individual mask visualization
-            show = SHOW_INDIVIDUAL_MASKS
-            if show:
-                visualize_individual_mask(
-                    i, original_image, mask_tensor, label, score,
-                    transform_params, polygon_coords, status
-                )
+            # Show individual mask visualization and save temporarily for PDF
+            save_path = None
+            if SHOW_INDIVIDUAL_MASKS or GENERATE_PDF:
+                save_path = os.path.join(output_path, f"{image_file}_mask_{i}.png")
+                temp_image_paths.append(save_path)  # Track for cleanup
+                
+            visualize_individual_mask(
+                i, original_image, mask_tensor, label, score,
+                transform_params, polygon_coords, status, save_path
+            )
+        
+        # Store results for this image
+        all_results.append({
+            'image_file': image_file,
+            'polygon_info': polygon_info,
+            'predictions': predictions,
+            'original_image_path': image_path,
+            'temp_image_paths': temp_image_paths  # Store temp paths for cleanup
+        })
+        
+        # Save JSON results if enabled
+        if SAVE_JSON:
+            save_results_json(image_file, polygon_info, predictions, output_path)
         
         # Print final summary for this image
         print(f"\n{'='*40}")
@@ -705,11 +1021,32 @@ def compare_all_test_images(model_path, test_images_path, output_path):
                 print(f"    * Polygon points: {info['polygon_points']}")
                 print(f"    * Original size: {info['mask_width_original']}x{info['mask_height_original']} px")
                 print(f"    * Area retention: {info['area_retention']:.1f}%")
+    
+    # Generate single PDF report for all images if enabled
+    if GENERATE_PDF and all_results:
+        print("\nCreating comprehensive PDF report for all images...")
+        pdf_path = create_comprehensive_pdf_report(output_path, all_results)
+        
+        if pdf_path:
+            print(f"PDF report created: {pdf_path}")
+            
+            # Clean up temporary mask images after PDF generation
+            print("Cleaning up temporary mask images...")
+            for result in all_results:
+                for temp_path in result.get('temp_image_paths', []):
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                        print(f"Removed temporary image: {temp_path}")
+            
+            print("Cleanup completed. Only PDF report remains in output folder.")
+        else:
+            print("Failed to create PDF report")
 
 
 # =============================================================================
 # ARGUMENT PARSING
 # =============================================================================
+
 
 def parse_arguments():
     """Parse command-line arguments."""
@@ -751,7 +1088,22 @@ def parse_arguments():
     debug_group.add_argument('--no_debug', action='store_true',
                             help='Disable detailed debugging output')
     
+    # PDF generation control
+    pdf_group = parser.add_mutually_exclusive_group()
+    pdf_group.add_argument('--pdf', action='store_true',
+                          help='Generate PDF report')
+    pdf_group.add_argument('--no_pdf', action='store_true',
+                          help='Do not generate PDF report')
+    
+    # JSON saving control
+    json_group = parser.add_mutually_exclusive_group()
+    json_group.add_argument('--json', action='store_true',
+                           help='Save JSON results')
+    json_group.add_argument('--no_json', action='store_true',
+                           help='Do not save JSON results')
+    
     return parser.parse_args()
+
 
 def main():
     """Main function with argument parsing."""
@@ -760,7 +1112,7 @@ def main():
     # Update global variables
     global CONFIDENCE_THRESHOLD, MODEL_PATH, TEST_IMAGES_PATH, OUTPUT_PATH
     global MIN_CONTOUR_AREA, PAUSE_FOR_EACH_MASK, SHOW_INDIVIDUAL_MASKS
-    global ENABLE_DETAILED_DEBUG
+    global ENABLE_DETAILED_DEBUG, GENERATE_PDF, SAVE_JSON
     
     CONFIDENCE_THRESHOLD = args.confidence_threshold
     MODEL_PATH = args.model_path
@@ -789,6 +1141,20 @@ def main():
         ENABLE_DETAILED_DEBUG = False
     # If neither is specified, keep global variable value
     
+    # Handle mutually exclusive PDF arguments
+    if args.pdf:
+        GENERATE_PDF = True
+    elif args.no_pdf:
+        GENERATE_PDF = False
+    # If neither is specified, keep global variable value
+    
+    # Handle mutually exclusive JSON arguments
+    if args.json:
+        SAVE_JSON = True
+    elif args.no_json:
+        SAVE_JSON = False
+    # If neither is specified, keep global variable value
+    
     print(f"Model: {MODEL_PATH}")
     print(f"Test images path: {TEST_IMAGES_PATH}")
     print(f"Output path: {OUTPUT_PATH}")
@@ -797,6 +1163,8 @@ def main():
     print(f"Show individual masks: {SHOW_INDIVIDUAL_MASKS}")
     print(f"Pause for each mask: {PAUSE_FOR_EACH_MASK}")
     print(f"Detailed debugging: {ENABLE_DETAILED_DEBUG}")
+    print(f"Generate PDF: {GENERATE_PDF}")
+    print(f"Save JSON: {SAVE_JSON}")
     
     # Process specific image or all test images
     if args.specific_image:
@@ -816,6 +1184,7 @@ def main():
     else:
         # Process all test images
         compare_all_test_images(MODEL_PATH, TEST_IMAGES_PATH, OUTPUT_PATH)
+
 
 if __name__ == "__main__":
     main()

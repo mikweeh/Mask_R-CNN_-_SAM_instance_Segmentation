@@ -6,8 +6,8 @@ inferenced masks into YoloV11 format with improved mask processing.
 """
 
 # TO DO: get_model_instance_segmentation() is used here and also
-# at train.py, so it should be placed as a helper function and imported
-# instead of being duplicated
+# at train.py (and most recently at pruebas_masks), so it should be placed
+# as a helper function and imported instead of being duplicated
 
 import argparse
 import os

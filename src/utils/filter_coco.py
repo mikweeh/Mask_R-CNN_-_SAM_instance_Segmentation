@@ -35,6 +35,19 @@ import os
 import shutil
 from typing import Dict, List, Set
 
+# =============================================================================
+# DEFAULT GLOBAL CONFIGURATION VARIABLES
+# =============================================================================
+
+# Default class configuration - can be overridden by arguments from main.py
+CLASSES_TO_KEEP = [
+    'Chromis chromis',
+    'Coris julis',
+]
+# =============================================================================
+# Functions
+# =============================================================================
+
 def load_image_list_from_txt(file_path: str) -> List[str]:
     """
     Loads a list of image filename prefixes from a text file.
@@ -263,15 +276,20 @@ def main() -> None:
         help='Path to the dataset directory (default: ./dataset)'
     )
     
+    # Add classes_to_keep argument
+    parser.add_argument('--classes_to_keep', type=str, default=None,
+                       help='JSON string with list of class names to keep')
+
     args = parser.parse_args()
     dataset_path = args.dataset_path
     
     print(f"Using dataset path: {dataset_path}")
     
-    # ====================================================================
-    # CONFIGURATION - MODIFY THESE VALUES
-    # ====================================================================
-    
+    # Update CLASSES_TO_KEEP from arguments if provided
+    global CLASSES_TO_KEEP
+    if args.classes_to_keep is not None:
+        CLASSES_TO_KEEP = json.loads(args.classes_to_keep)
+
     # --- Input Files ---
     # Path to the original COCO annotation file (automatically detected)
     original_coco_dir = os.path.join(dataset_path, 'original_coco')
@@ -313,13 +331,6 @@ def main() -> None:
     images_to_keep_test = load_image_list_from_txt(
         os.path.join(dataset_path, 'test.txt')
     )
-    
-    # List of class names you are interested in.
-    global CLASSES_TO_KEEP
-    CLASSES_TO_KEEP = [
-        'Chromis chromis',
-        'Coris julis',
-    ]
     
     print("Starting COCO dataset filtering for all splits...")
     

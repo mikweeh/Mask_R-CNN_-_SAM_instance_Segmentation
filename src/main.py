@@ -8,6 +8,7 @@ Main script that runs the complete fish segmentation pipeline:
 4. Combine inference labels with original YOLO labels (adapt2rbf.py)
 """
 
+import argparse
 import subprocess
 import sys
 import os
@@ -64,11 +65,12 @@ RPN_NMS_THRESH = 0.6
 
 # Output configuration
 REPORT_OUTPUT_PATH = "results"
+INFERENCE_FOLDER_PATH = os.path.join(DATASET_PATH, "inference")
 
 # Inference configuration (for coco2yolo11.py)
-INPUT_IMAGES_FOLDER = "dataset/test"
-OUTPUT_LABELS_FOLDER = "dataset/inference/labels"
-OUTPUT_IMAGES_FOLDER = "dataset/inference/images"
+INPUT_IMAGES_FOLDER = os.path.join(DATASET_PATH, "test")
+OUTPUT_LABELS_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels")
+OUTPUT_IMAGES_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "images")
 
 # =============================================================================
 # POLYGON SIMPLIFICATION CONFIGURATION
@@ -82,15 +84,29 @@ MIN_CONTOUR_AREA = 50                   # Minimum contour area to consider
 # =============================================================================
 
 # Label combination configuration (for adapt2rbf.py)
-INFERENCE_LABELS_FOLDER = "dataset/inference/labels"
-ORIGINAL_YOLO_LABELS_FOLDER = "dataset/original_yolo/train/labels"
-COMBINED_LABELS_OUTPUT_FOLDER = "dataset/inference/labels_full"
+INFERENCE_LABELS_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels")
+ORIGINAL_YOLO_LABELS_FOLDER = os.path.join(DATASET_PATH, "original_yolo/train/labels")
+COMBINED_LABELS_OUTPUT_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels_full")
+UPLOAD_FOLDER = os.path.join(DATASET_PATH, "upload")
 
 # Generate class names mapping for YOLO (derived from above)
 CLASS_NAMES_MAPPING = {}
 for coco_id, yolo_id in COCO_TO_YOLO_CLASS_MAPPING.items():
     if coco_id <= len(CLASSES_TO_KEEP):
         CLASS_NAMES_MAPPING[yolo_id] = CLASSES_TO_KEEP[coco_id - 1]
+
+# =============================================================================
+# COMMAND LINE ARGUMENT PARSING
+# =============================================================================
+
+# Parse command line arguments for execution mode
+parser = argparse.ArgumentParser(description='Fish segmentation pipeline')
+parser.add_argument('--mode', type=str, choices=['full', 'inference'], 
+                    default='full',
+                    help='Execution mode: "full" runs all steps, '
+                         '"inference" runs only coco2yolo and adapt2rbf')
+args = parser.parse_args()
+
 
 # =============================================================================
 # MODEL NAMING LOGIC (MOVED FROM train.py)
@@ -129,12 +145,13 @@ def get_next_model_name(base_name):
 # FINALIZE PATHS AFTER MODEL NAME IS DETERMINED
 # =============================================================================
 
-def initialize_paths():
+def initialize_paths(mode):
     """Initialize all paths after model name is finalized."""
     global MODEL_NAME, MODEL_WEIGHTS_PATH
     
     # Get the actual model name/path that will be used
-    MODEL_WEIGHTS_PATH = get_next_model_name(BASE_MODEL_NAME)
+    MODEL_WEIGHTS_PATH = get_next_model_name(
+        BASE_MODEL_NAME) if mode == "full" else f"weights/{BASE_MODEL_NAME}.pth"
     MODEL_NAME = os.path.splitext(os.path.basename(MODEL_WEIGHTS_PATH))[0]
     
     print(f"Model will be saved as: {MODEL_WEIGHTS_PATH}")
@@ -145,6 +162,20 @@ def initialize_paths():
 # =============================================================================
 # PIPELINE FUNCTIONS
 # =============================================================================
+
+def cleanup_folder(folder_path):
+    """
+    Remove the folder to clean up previous results.
+    """
+    if os.path.exists(folder_path):
+        print(f"Removing existing folder: {folder_path}")
+        try:
+            shutil.rmtree(folder_path)
+            print("Folder removed successfully.")
+        except Exception as e:
+            print(f"Warning: Could not remove folder: {e}")
+    else:
+        print(f"No existing {folder_path} folder found.")
 
 def print_step_header(step_num, step_name):
     """Print a formatted header for each pipeline step"""
@@ -167,8 +198,9 @@ def run_filter_coco():
     print(f"Classes to keep: {CLASSES_TO_KEEP}")
     
     try:
-        # Run filter_coco.py with dataset path argument
-        cmd = [sys.executable, "src/utils/filter_coco.py", DATASET_PATH]
+        # Run filter_coco.py with dataset path and classes arguments
+        cmd = [sys.executable, "src/utils/filter_coco.py", DATASET_PATH,
+               "--classes_to_keep", json.dumps(CLASSES_TO_KEEP)]
         print(f"Running command: {' '.join(cmd)}")
         result = subprocess.run(cmd, check=True)
         print_step_footer("COCO Dataset Filtering")
@@ -298,8 +330,9 @@ def run_adapt2rbf():
             "--inference_folder", INFERENCE_LABELS_FOLDER,
             "--original_folder", ORIGINAL_YOLO_LABELS_FOLDER,
             "--output_folder", COMBINED_LABELS_OUTPUT_FOLDER,
-            # Pass class configuration from main.py
-            "--target_classes", json.dumps(TARGET_CLASSES_FOR_REPLACEMENT)
+            "--target_classes", json.dumps(TARGET_CLASSES_FOR_REPLACEMENT),
+            "--upload_folder", UPLOAD_FOLDER,
+            "--original_img_folder", INPUT_IMAGES_FOLDER,
         ]
         
         print(f"Running label combination with {len(cmd)} parameters...")
@@ -362,27 +395,37 @@ def main():
     
     print("FISH SEGMENTATION COMPLETE PIPELINE")
     print(f"Started at: {pipeline_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Execution mode: {args.mode}")
     
     # Initialize model paths first
-    model_path = initialize_paths()
+    model_path = initialize_paths(args.mode)
     
     print_pipeline_summary()
     check_prerequisites()
     
     try:
-        run_filter_coco()
-        run_training(model_path)
-        run_coco2yolo(model_path)
-        run_adapt2rbf()
+        if args.mode == 'full':
+            # Run complete pipeline
+            run_filter_coco()
+            run_training(model_path)
+            run_coco2yolo(model_path)
+            run_adapt2rbf()
+        elif args.mode == 'inference':
+            # Run only inference steps (assuming model is already trained)
+            print("Skipping filter_coco and training steps...")
+            cleanup_folder(INFERENCE_FOLDER_PATH)
+            cleanup_folder(UPLOAD_FOLDER)
+            run_coco2yolo(model_path)
+            run_adapt2rbf()
         
         pipeline_end_time = datetime.now()
         duration = pipeline_end_time - pipeline_start_time
         
         print("\n" + "="*80)
-        print("!!!COMPLETE PIPELINE FINISHED SUCCESSFULLY!!!")
+        print("!!!PIPELINE FINISHED SUCCESSFULLY!!!")
         print("="*80)
         print(f"Total duration: {str(duration).split('.')[0]}")
-        print(f"Model saved at: {model_path}")
+        print(f"Model path: {model_path}")
         print("="*80)
         
     except KeyboardInterrupt:
@@ -394,3 +437,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # --mode inference

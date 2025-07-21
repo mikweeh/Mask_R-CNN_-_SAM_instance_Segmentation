@@ -11,7 +11,10 @@ other class annotations.
 import os
 import argparse
 import json
+import random
+import shutil
 from pathlib import Path
+from PIL import Image
 
 # =============================================================================
 # DEFAULT GLOBAL CONFIGURATION VARIABLES
@@ -20,7 +23,9 @@ from pathlib import Path
 # Default paths
 INFERENCE_FOLDER = "dataset/inference/labels"
 ORIGINAL_FOLDER = "dataset/original_yolo/train/labels"
+ORIGINAL_IMG_FOLDER = "dataset/test"
 OUTPUT_FOLDER = "dataset/inference/labels_full"
+ORIGINAL_YOLO_DATA_YAML = "dataset/original_yolo/data.yaml"
 
 # Default processing configuration - can be overridden by arguments from main.py
 TARGET_CLASSES = {0, 1}  # Default classes to replace with inference results
@@ -61,16 +66,32 @@ def parse_arguments():
         help='JSON string with list of target classes to replace'
     )
     
+    # Folder used to upload the results to roboflow (containing original images and infered labels)
+    parser.add_argument(
+        '--upload_folder',
+        type=str,
+        default=None,
+        help='Optional folder for upload files (copy images, labels, yaml)'
+    )
+
+    # Folder with original images
+    parser.add_argument(
+        '--original_img_folder', 
+        default=ORIGINAL_IMG_FOLDER,
+        help='Path to folder containing original images'
+    )
+
     return parser.parse_args()
 
 def update_global_variables(args):
     """Update global variables with command-line arguments."""
-    global INFERENCE_FOLDER, ORIGINAL_FOLDER, OUTPUT_FOLDER, TARGET_CLASSES
+    global INFERENCE_FOLDER, ORIGINAL_FOLDER, OUTPUT_FOLDER, TARGET_CLASSES, ORIGINAL_IMG_FOLDER
     
     # Update standard global variables
     INFERENCE_FOLDER = args.inference_folder
     ORIGINAL_FOLDER = args.original_folder
     OUTPUT_FOLDER = args.output_folder
+    ORIGINAL_IMG_FOLDER = args.original_img_folder
     
     # Update class configuration ONLY if provided as argument
     if args.target_classes is not None:
@@ -83,6 +104,25 @@ def update_global_variables(args):
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+def clean_roboflow_filename(filename):
+    """
+    Remove Roboflow-generated text from filename.
+    
+    Args:
+        filename: Original filename that may contain .rf. pattern
+        
+    Returns:
+        str: Cleaned filename with .rf. pattern removed
+    """
+    if ".rf." in filename:
+        # Split by .rf. and take only the first part
+        base_part = filename.split(".rf.")[0]
+        # Get the original extension
+        original_ext = os.path.splitext(filename)[1]
+        return base_part + original_ext
+    return filename
+
 
 def read_yolo_labels(label_path):
     """
@@ -249,6 +289,149 @@ def process_label_files(inference_folder, original_folder, output_folder):
     
     return stats
 
+def copy_images_to_upload(src_folder, dest_folder):
+    """
+    Copy image files from source folder to destination folder.
+    
+    Args:
+        src_folder: Path to source folder containing images
+        dest_folder: Path to destination folder
+    
+    Returns:
+        List of copied filenames
+    """
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff'}
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
+    
+    copied_files = []
+    if os.path.exists(src_folder):
+        for filename in os.listdir(src_folder):
+            if os.path.splitext(filename)[1].lower() in image_extensions:
+                src_path = os.path.join(src_folder, filename)
+                if os.path.isfile(src_path):
+                    # Clean the filename before copying
+                    clean_filename = clean_roboflow_filename(filename)
+                    dest_path = os.path.join(dest_folder, clean_filename)
+                    shutil.copy2(src_path, dest_path)
+                    copied_files.append(clean_filename)
+    return copied_files
+
+
+def copy_labels_to_upload(src_folder, dest_folder):
+    """
+    Copy label files from source folder to destination folder.
+    
+    Args:
+        src_folder: Path to source folder containing label files
+        dest_folder: Path to destination folder
+    
+    Returns:
+        List of copied filenames
+    """
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
+    
+    copied_files = []
+    if os.path.exists(src_folder):
+        for filename in os.listdir(src_folder):
+            if filename.endswith('.txt'):
+                src_path = os.path.join(src_folder, filename)
+                if os.path.isfile(src_path):
+                    # Clean the filename before copying
+                    clean_filename = clean_roboflow_filename(filename)
+                    dest_path = os.path.join(dest_folder, clean_filename)
+                    shutil.copy2(src_path, dest_path)
+                    copied_files.append(clean_filename)
+    return copied_files
+
+
+def copy_data_yaml(src_yaml_path, dest_folder):
+    """
+    Copy data.yaml file to destination folder.
+    
+    Args:
+        src_yaml_path: Path to source data.yaml file
+        dest_folder: Path to destination folder
+    
+    Returns:
+        bool: True if file was copied, False otherwise
+    """
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
+    
+    if os.path.exists(src_yaml_path) and os.path.isfile(src_yaml_path):
+        shutil.copy2(src_yaml_path, dest_folder)
+        return True
+    return False
+
+def modify_pixel_rgb(image_path):
+    """
+    Modify the RGB value of pixel at position (0,0) to a random value.
+    
+    Args:
+        image_path: Path to the image file to modify
+    
+    Returns:
+        bool: True if pixel was modified successfully, False otherwise
+    """
+    try:
+        # Open the image
+        image = Image.open(image_path)
+        
+        # Ensure the image is in RGB mode
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Load pixel data
+        pixels = image.load()
+        
+        # Generate random RGB values
+        new_rgb = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+        
+        # Modify the pixel at position (0,0)
+        pixels[0, 0] = new_rgb
+        
+        # Save the modified image
+        image.save(image_path)
+        
+        return True
+    except Exception as e:
+        print(f"  - Error modifying pixel for {image_path}: {str(e)}")
+        return False
+
+def modify_all_copied_images(upload_folder, copied_images):
+    """
+    Modify the RGB value of pixel (0,0) for all copied images.
+    
+    Args:
+        upload_folder: Path to folder containing copied images
+        copied_images: List of copied image filenames
+    
+    Returns:
+        int: Number of successfully modified images
+    """
+    print("\n" + "=" * 50)
+    print("MODIFYING PIXEL RGB VALUES")
+    print("=" * 50)
+    
+    modified_count = 0
+    
+    for filename in copied_images:
+        image_path = os.path.join(upload_folder, filename)
+        # print(f"Modifying pixel (0,0) for: {filename}")
+        
+        if modify_pixel_rgb(image_path):
+            modified_count += 1
+        #     print(f"  - Successfully modified")
+        # else:
+        #     print(f"  - Failed to modify")
+    
+    print(f"\nTotal images with modified pixels: {modified_count}/{len(copied_images)}")
+    print("=" * 50)
+    
+    return modified_count
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -294,6 +477,39 @@ def main():
     print(f"Empty inference files: {stats['empty_inference']}")
     print(f"Errors encountered: {stats['errors']}")
     print(f"\nOutput saved to: {OUTPUT_FOLDER}")
+
+
+    # Setup upload folder
+    if args.upload_folder:
+        print("\n" + "=" * 50)
+        print("COPYING FILES TO UPLOAD FOLDER")
+        print("=" * 50)
+        print(f"Upload folder: {args.upload_folder}")
+        
+        # Define source paths
+        test_images_folder = ORIGINAL_IMG_FOLDER
+        inference_labels_full_folder = OUTPUT_FOLDER
+        original_yolo_data_yaml = ORIGINAL_YOLO_DATA_YAML
+        
+        # Copy files to upload folder
+        copied_images = copy_images_to_upload(test_images_folder, 
+                                              args.upload_folder)
+        copied_labels = copy_labels_to_upload(inference_labels_full_folder, 
+                                              args.upload_folder)
+        copied_yaml = copy_data_yaml(original_yolo_data_yaml, 
+                                     args.upload_folder)
+        
+        # Print summary
+        print(f"Copied {len(copied_images)} image files")
+        print(f"Copied {len(copied_labels)} label files")
+        print(f"Copied data.yaml file: {copied_yaml}")
+        print(f"Upload folder created at: {args.upload_folder}")
+        print("=" * 50)
+        
+        # Modify pixel RGB values for all copied images
+        if copied_images:
+            modify_all_copied_images(args.upload_folder, copied_images)
+
 
 if __name__ == "__main__":
     main()
