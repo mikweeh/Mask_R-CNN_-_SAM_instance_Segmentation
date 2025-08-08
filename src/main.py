@@ -40,7 +40,7 @@ TARGET_CLASSES_FOR_REPLACEMENT = [0, 1]
 # =============================================================================
 
 # Base model name - will be updated to ensure uniqueness
-BASE_MODEL_NAME = "m02"
+BASE_MODEL_NAME = "m04"
 NUM_CLASSES = len(CLASSES_TO_KEEP) + 1 # +1 for background class
 
 # Training parameters
@@ -85,7 +85,7 @@ MIN_CONTOUR_AREA = 50                   # Minimum contour area to consider
 
 # Label combination configuration (for adapt2rbf.py)
 INFERENCE_LABELS_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels")
-ORIGINAL_YOLO_LABELS_FOLDER = os.path.join(DATASET_PATH, "original_yolo/train/labels")
+ORIGINAL_YOLO_LABELS_FOLDER = os.path.join(DATASET_PATH, "original_yolo/test/labels")
 COMBINED_LABELS_OUTPUT_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels_full")
 UPLOAD_FOLDER = os.path.join(DATASET_PATH, "upload")
 
@@ -389,6 +389,7 @@ def print_pipeline_summary():
     print(f"Minimum Contour Area: {MIN_CONTOUR_AREA}")
     print("="*80)
 
+
 def main():
     """Main pipeline execution function."""
     pipeline_start_time = datetime.now()
@@ -434,6 +435,7 @@ def main():
     except Exception as e:
         print(f"\n\nUnexpected error in pipeline: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

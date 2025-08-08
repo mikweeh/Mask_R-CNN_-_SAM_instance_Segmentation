@@ -124,6 +124,41 @@ def find_coco_annotation_file(original_coco_dir: str) -> str:
     return os.path.join(original_coco_dir, json_files[0])
 
 
+def create_list_file_if_missing(txt_path: str, images_dir: str) -> None:
+    """
+    Create a text file listing image filenames with a trailing comma if missing.
+    
+    Args:
+        txt_path: Path to the .txt file to create
+        images_dir: Directory containing the image files to list
+    """
+    if not os.path.exists(txt_path):
+        print(f"Creating missing file: {txt_path}")
+        # List image files in images_dir
+        try:
+            files = os.listdir(images_dir)
+        except FileNotFoundError:
+            print(f"WARNING: Directory {images_dir} not found, "
+                  f"cannot create {txt_path}")
+            return
+        
+        # Filter to common image extensions
+        image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', 
+                          '.tif', '.webp', '.gif')
+        image_files = [f for f in files 
+                      if f.lower().endswith(image_extensions)]
+        
+        # Write filenames (with extension) one per line ending with a comma
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            for filename in sorted(image_files):
+                f.write(filename + ',\n')
+        
+        print(f"Created {txt_path} with {len(image_files)} image filenames "
+              f"from {images_dir}")
+    else:
+        print(f"File {txt_path} already exists, skipping creation.")
+
+
 def filter_coco_dataset(images_to_keep: List[str], new_annotation_file: str, 
                         dataset_name: str, original_annotation_file: str) -> None:
     """
@@ -259,16 +294,18 @@ def filter_coco_dataset(images_to_keep: List[str], new_annotation_file: str,
     print(f"Copied {len(copied_files)} images to {output_dir}")
     print(f"=== {dataset_name.upper()} dataset processing complete! ===")
 
-
 def main() -> None:
     """
     Main function that processes all three datasets (train, valid, test).
+    Each dataset now uses its own annotation file from the corresponding 
+    subfolder.
     """
     # Set up command-line argument parsing
     parser = argparse.ArgumentParser(
         description='Filter COCO dataset by images and classes, creating '
                    'train/valid/test splits'
     )
+    
     parser.add_argument(
         'dataset_path',
         nargs='?',
@@ -279,81 +316,107 @@ def main() -> None:
     # Add classes_to_keep argument
     parser.add_argument('--classes_to_keep', type=str, default=None,
                        help='JSON string with list of class names to keep')
-
+    
     args = parser.parse_args()
     dataset_path = args.dataset_path
-    
     print(f"Using dataset path: {dataset_path}")
-    
+
+    # Create train.txt, valid.txt, test.txt if missing using files from 
+    # original_coco subdirs
+    print("Checking for missing .txt files and creating if necessary...")
+    create_list_file_if_missing(
+        os.path.join(dataset_path, 'train.txt'),
+        os.path.join(dataset_path, 'original_coco', 'train')
+    )
+    create_list_file_if_missing(
+        os.path.join(dataset_path, 'valid.txt'),
+        os.path.join(dataset_path, 'original_coco', 'valid')
+    )
+    create_list_file_if_missing(
+        os.path.join(dataset_path, 'test.txt'),
+        os.path.join(dataset_path, 'original_coco', 'test')
+    )
+
     # Update CLASSES_TO_KEEP from arguments if provided
     global CLASSES_TO_KEEP
     if args.classes_to_keep is not None:
         CLASSES_TO_KEEP = json.loads(args.classes_to_keep)
-
-    # --- Input Files ---
-    # Path to the original COCO annotation file (automatically detected)
+    
+    # --- Input Files
     original_coco_dir = os.path.join(dataset_path, 'original_coco')
+    
+    # Define paths for each split's annotation file
+    train_coco_dir = os.path.join(original_coco_dir, 'train')
+    valid_coco_dir = os.path.join(original_coco_dir, 'valid')
+    test_coco_dir = os.path.join(original_coco_dir, 'test')
+    
+    # Find annotation files for each split
     try:
-        try:
-            # Try to find annotation file in original_coco_dir
-            original_annotation_file = find_coco_annotation_file(
-                original_coco_dir
-            )
-        except FileNotFoundError:
-            # Try to find annotation file in original_coco/train/
-            alt_coco_dir = os.path.join(original_coco_dir, 'train')
-            original_annotation_file = find_coco_annotation_file(
-                alt_coco_dir
-            )
-            original_coco_dir = alt_coco_dir  # Update to new working dir
+        train_annotation_file = find_coco_annotation_file(train_coco_dir)
+        print(f"Found train annotation file: {train_annotation_file}")
     except FileNotFoundError as e:
-        print(f"ERROR: {e}")
+        print(f"ERROR: Could not find train annotation file: {e}")
         return
     
+    try:
+        valid_annotation_file = find_coco_annotation_file(valid_coco_dir)
+        print(f"Found valid annotation file: {valid_annotation_file}")
+    except FileNotFoundError as e:
+        print(f"ERROR: Could not find valid annotation file: {e}")
+        return
+    
+    try:
+        test_annotation_file = find_coco_annotation_file(test_coco_dir)
+        print(f"Found test annotation file: {test_annotation_file}")
+    except FileNotFoundError as e:
+        print(f"ERROR: Could not find test annotation file: {e}")
+        return
+
     # --- Output Files ---
     # Paths where the new filtered annotation files will be saved.
-    new_annotation_file_train = os.path.join(dataset_path, 'train', 
+    new_annotation_file_train = os.path.join(dataset_path, 'train',
                                            '_annotations_filtered.coco.json')
-    new_annotation_file_valid = os.path.join(dataset_path, 'valid', 
+    new_annotation_file_valid = os.path.join(dataset_path, 'valid',
                                            '_annotations_filtered.coco.json')
-    new_annotation_file_test = os.path.join(dataset_path, 'test', 
+    new_annotation_file_test = os.path.join(dataset_path, 'test',
                                           '_annotations_filtered.coco.json')
     
     # --- Filtering Criteria ---
-    
     # Load image filename prefixes from text files
     images_to_keep_train = load_image_list_from_txt(
         os.path.join(dataset_path, 'train.txt')
     )
+    
     images_to_keep_valid = load_image_list_from_txt(
         os.path.join(dataset_path, 'valid.txt')
     )
+    
     images_to_keep_test = load_image_list_from_txt(
         os.path.join(dataset_path, 'test.txt')
     )
     
     print("Starting COCO dataset filtering for all splits...")
     
-    # Process train dataset
-    filter_coco_dataset(images_to_keep_train, new_annotation_file_train, 
-                       "train", original_annotation_file)
+    # Process train dataset with train annotation file
+    filter_coco_dataset(images_to_keep_train, new_annotation_file_train,
+                       "train", train_annotation_file)
     
-    # Process validation dataset
-    filter_coco_dataset(images_to_keep_valid, new_annotation_file_valid, 
-                       "valid", original_annotation_file)
+    # Process validation dataset with valid annotation file
+    filter_coco_dataset(images_to_keep_valid, new_annotation_file_valid,
+                       "valid", valid_annotation_file)
     
-    # Process test dataset
-    filter_coco_dataset(images_to_keep_test, new_annotation_file_test, 
-                       "test", original_annotation_file)
+    # Process test dataset with test annotation file
+    filter_coco_dataset(images_to_keep_test, new_annotation_file_test,
+                       "test", test_annotation_file)
     
     print("\n" + "="*60)
     print("ALL DATASETS PROCESSED SUCCESSFULLY!")
     print("Created directories:")
-    print(f"  - {dataset_path}/train/ with {len(images_to_keep_train)} "
+    print(f" - {dataset_path}/train/ with {len(images_to_keep_train)} "
           f"image prefixes")
-    print(f"  - {dataset_path}/valid/ with {len(images_to_keep_valid)} "
+    print(f" - {dataset_path}/valid/ with {len(images_to_keep_valid)} "
           f"image prefixes")
-    print(f"  - {dataset_path}/test/ with {len(images_to_keep_test)} "
+    print(f" - {dataset_path}/test/ with {len(images_to_keep_test)} "
           f"image prefixes")
     print("="*60)
 

@@ -25,21 +25,24 @@ variable points to the absolute path of your machine where you have the
 dataset. This path is the one that will be mapped to the './dataset' path
 inside the container ('/ws/dataset')
 
-The dataset folder structure at the beginning must be at least this:
+The dataset folder structure at the beginning must be the following (note that
+'original_coco' and 'original_yolo' are the folders exactly as they are downloaded
+from roboflow in coco format and in yolov11 format respectively):
 ```
  dataset/
      |_ original_coco/       # Folder containing the original COCO annotation file and original images
+     |      |_ train/        # Folder containing all the training image files
+     |      |_ valid/        # Folder containing all the validation image files
+     |      |_ test/         # Folder containing all the test image files
      |_ original_yolo/       # Folder containing the original yolo annotation files and original images
      |      |_ data.yaml     # Info about the classes
-     |      |_ train/        # Folder containing all the image files
+     |      |_ train/        # Folder containing all the training image files
+     |      |_ valid/        # Folder containing all the validation image files
+     |      |_ test/         # Folder containing all the test image files
      |_ train.txt            # Text file listing image filenames for training
      |_ valid.txt            # Text file listing image filenames for validation
      |_ test.txt             # Text file listing image filenames for test
 ```
-
-
-Note that 'original_coco' and 'original_yolo' contain the folders exactly as
-they come directly from downloading them from Roboflow.
 
 'train.txt', 'valid.txt' and 'test.txt' are files with one filename per line.
 This filename can be in quotes or not, and can have the extension or not (it
@@ -49,6 +52,10 @@ image_001,
 'image_002',
 'image_003.jpg',
 ```
+
+These text files can be provided if you want to specify the 3 splits of the dataset;
+but if you want to use those downloaded by default just don't provide them and
+they will be automatically generated.
 
 # Functionality
 
@@ -99,7 +106,9 @@ At the end, therefore, the folder structure you will have will be this:
      |_ original_coco/       # Folder containing the original COCO annotation file and original images
      |_ original_yolo/       # Folder containing the original yolo annotation files and original images
      |      |_ data.yaml     # Info about the classes
-     |      |_ train/        # Folder containing all the image files
+     |      |_ train/        # Folder containing all the training image files
+     |      |_ valid/        # Folder containing all the validation image files
+     |      |_ test/         # Folder containing all the test image files
      |_ inference            # Folder with the results of the inference process
             |_ images        # Folder with test images with inferenced mask overlapped
             |_ labels        # Folder with original label files of the test images

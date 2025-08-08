@@ -22,7 +22,7 @@ from PIL import Image
 
 # Default paths
 INFERENCE_FOLDER = "dataset/inference/labels"
-ORIGINAL_FOLDER = "dataset/original_yolo/train/labels"
+ORIGINAL_FOLDER = "dataset/original_yolo/test/labels"
 ORIGINAL_IMG_FOLDER = "dataset/test"
 OUTPUT_FOLDER = "dataset/inference/labels_full"
 ORIGINAL_YOLO_DATA_YAML = "dataset/original_yolo/data.yaml"
@@ -513,5 +513,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # datasets/inference/labels datasets/original_yolo/labels --output_folder datasets/inference/labels_full
+    # datasets/inference/labels datasets/original_yolo/test/labels --output_folder datasets/inference/labels_full
 

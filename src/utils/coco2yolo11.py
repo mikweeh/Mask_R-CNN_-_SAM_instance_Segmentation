@@ -725,12 +725,12 @@ def main():
                 original_size = (original_height, original_width)
             
             try:
-                # Perform inference with filtering (NEW METHOD)
+                # Perform inference with filtering
                 predictions = perform_single_inference_with_filtering(
                     model, image_path, transforms
                 )
                 
-                # Convert to YoloV11 format with new algorithm
+                # Convert to YoloV11 format
                 yolo_annotations = convert_to_yolo_format(
                     predictions, original_size
                 )
