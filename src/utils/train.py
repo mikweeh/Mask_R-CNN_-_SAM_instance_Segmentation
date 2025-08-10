@@ -1777,7 +1777,14 @@ def main():
             best_val_loss = val_loss
             torch.save(model.state_dict(), MODEL_PATH)
             print(f"Model saved (val_loss improved to {val_loss:.4f}): {MODEL_PATH}")
-        
+
+        # Save model every 25 epochs starting at epoch 100
+        elif (epoch + 1) >= 100 and (epoch + 1) % 25 == 0:
+            epoch_path = f"weights/epoch{epoch + 1:03d}.pth"
+            os.makedirs(os.path.dirname(epoch_path), exist_ok=True)
+            torch.save(model.state_dict(), epoch_path)
+            print(f"Model saved at epoch {epoch + 1}: {epoch_path}")
+
         del val_loss
         clear_gpu_memory()
 
