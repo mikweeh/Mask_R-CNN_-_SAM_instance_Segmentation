@@ -75,6 +75,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 IMG_SIZE = 1024
 MASK_THRESHOLD = 0.5
+MIN_MASK_AREA = 100
 
 REPORT_OUTPUT_PATH = "results"
 TEMP_FIGURES_PATH = os.path.join(REPORT_OUTPUT_PATH, "imgs")
@@ -517,11 +518,161 @@ def calculate_validation_loss(predictor, dataloader, device):
 
 
 # =============================================================================
-# PDF Report Generation (UNCHANGED)
+# PDF Report Generation
 # =============================================================================
 
+def generate_test_inference_examples(predictor, output_path, num_samples=5):
+    """
+    Generate inference examples on test images for the PDF report.
+    
+    Args:
+        predictor: Trained SAM2ImagePredictor
+        output_path: Path to save visualization images
+        num_samples: Number of test images to process
+    
+    Returns:
+        List of paths to saved inference visualization images
+    """
+    predictor.model.eval()
+    processed_paths = []
+    
+    # Get test images
+    test_images_path = os.path.join(DATASET_PATH, "test")
+    
+    if not os.path.exists(test_images_path):
+        print(f"Test images folder not found: {test_images_path}")
+        return processed_paths
+    
+    # Get list of test images
+    test_image_files = [
+        f for f in os.listdir(test_images_path)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ]
+    
+    if len(test_image_files) == 0:
+        print("No test images found.")
+        return processed_paths
+    
+    # Sample random images
+    import random
+    sampled_files = random.sample(
+        test_image_files, 
+        min(num_samples, len(test_image_files))
+    )
+    
+    print(f"\nGenerating {len(sampled_files)} test inference examples...")
+    
+    for idx, image_file in enumerate(sampled_files):
+        try:
+            image_path = os.path.join(test_images_path, image_file)
+            print(f"  Processing {idx+1}/{len(sampled_files)}: {image_file}")
+            
+            # Load image
+            image = cv2.imread(image_path)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Set image
+            predictor.set_image(image_rgb)
+            image_embeddings = predictor._features["image_embed"]
+            
+            # Generate masks using grid sampling
+            H, W = image_rgb.shape[:2]
+            num_points = 16
+            y_points = np.linspace(0, H-1, num_points, dtype=np.float32)
+            x_points = np.linspace(0, W-1, num_points, dtype=np.float32)
+            
+            masks = []
+            
+            for y in y_points:
+                for x in x_points:
+                    point_coords = torch.tensor(
+                        [[[x, y]]], dtype=torch.float32, device=DEVICE
+                    )
+                    point_labels = torch.ones(
+                        (1, 1), dtype=torch.int32, device=DEVICE
+                    )
+                    
+                    try:
+                        sparse_embeddings, dense_embeddings = (
+                            predictor.model.sam_prompt_encoder(
+                                points=(point_coords, point_labels),
+                                boxes=None,
+                                masks=None,
+                            )
+                        )
+                        
+                        high_res_features = None
+                        if "high_res_feats" in predictor._features:
+                            high_res_features = [
+                                feat_level[-1].unsqueeze(0) 
+                                for feat_level in 
+                                predictor._features["high_res_feats"]
+                            ]
+                        
+                        with torch.no_grad():
+                            low_res_masks, _, _, _ = (
+                                predictor.model.sam_mask_decoder(
+                                    image_embeddings=image_embeddings,
+                                    image_pe=(
+                                        predictor.model.sam_prompt_encoder.get_dense_pe()
+                                    ),
+                                    sparse_prompt_embeddings=sparse_embeddings,
+                                    dense_prompt_embeddings=dense_embeddings,
+                                    multimask_output=False,
+                                    repeat_image=False,
+                                    high_res_features=high_res_features,
+                                )
+                            )
+                        
+                        pred_mask = F.interpolate(
+                            low_res_masks,
+                            size=(H, W),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                        
+                        mask_np = (
+                            torch.sigmoid(pred_mask) > 0.5
+                        ).cpu().numpy()[0, 0]
+                        
+                        if mask_np.sum() >= MIN_MASK_AREA:
+                            masks.append(mask_np.astype(np.uint8))
+                    
+                    except Exception:
+                        continue
+            
+            # Create visualization
+            result_image = image.copy()
+            class_colors = {0: (0, 255, 0), 1: (255, 0, 0)}
+            color = class_colors.get(TARGET_CLASS_INDEX, (255, 255, 255))
+            alpha = 0.4
+            
+            for mask in masks:
+                colored_mask = np.zeros_like(result_image)
+                colored_mask[mask > 0] = color
+                mask_area = mask > 0
+                result_image[mask_area] = cv2.addWeighted(
+                    result_image[mask_area], 1.0 - alpha,
+                    colored_mask[mask_area], alpha, 0
+                )
+            
+            # Save visualization
+            output_filename = f"test_inference_{idx+1}.jpg"
+            output_filepath = os.path.join(output_path, output_filename)
+            cv2.imwrite(output_filepath, result_image)
+            
+            processed_paths.append(output_filepath)
+            print(f"    Saved: {output_filename} ({len(masks)} masks)")
+            
+        except Exception as e:
+            print(f"    Error processing {image_file}: {e}")
+            continue
+    
+    return processed_paths
+
+
 def generate_training_report(train_losses, val_losses, training_start,
-                             training_end):
+                             training_end, test_image_paths=None):
     """Generate PDF training report."""
     if not REPORTLAB_AVAILABLE:
         print("ReportLab not available, skipping PDF generation")
@@ -603,7 +754,19 @@ def generate_training_report(train_losses, val_losses, training_start,
     story.append(Paragraph("Training Metrics", styles['Heading2']))
     story.append(Spacer(1, 10))
     story.append(RLImage(training_plots_path, width=7*inch, height=2.5*inch))
-    
+
+    if test_image_paths and len(test_image_paths) > 0:
+        story.append(Spacer(1, 30))
+        story.append(Paragraph("Test Inference Examples", styles['Heading2']))
+        story.append(Spacer(1, 10))
+        
+        for idx, img_path in enumerate(test_image_paths):
+            if img_path and os.path.exists(img_path):
+                story.append(Paragraph(f"Test Image {idx+1}", styles['Heading3']))
+                story.append(RLImage(img_path, width=6*inch, height=4*inch))
+                story.append(Spacer(1, 20))
+
+    # Build PDF
     doc.build(story)
     print(f"Training report generated: {report_path}")
     
@@ -751,10 +914,20 @@ def main():
     training_end_time = datetime.now()
     print(f"\nTraining completed!")
     print(f"Best Validation Loss: {best_val_loss:.4f}")
-    
-    # Generate report
-    generate_training_report(train_losses, val_losses,
-                            training_start_time, training_end_time)
+
+    # Generate test inference examples
+    print("\nGenerating test inference examples for report...")
+    test_inference_paths = generate_test_inference_examples(
+        predictor, TEMP_FIGURES_PATH, num_samples=5
+    )
+
+    # Generate report with test images
+    print("\nGenerating PDF training report...")
+    generate_training_report(
+        train_losses, val_losses,
+        training_start_time, training_end_time,
+        test_inference_paths  # Pass test images
+    )
     
     print("\n" + "="*60)
     print("TRAINING COMPLETE!")

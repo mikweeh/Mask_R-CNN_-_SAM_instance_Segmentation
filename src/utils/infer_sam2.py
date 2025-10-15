@@ -39,19 +39,24 @@ OUTPUT_LABELS_FOLDER = 'dataset/inference/labels'
 OUTPUT_IMAGES_FOLDER = 'dataset/inference/images'
 
 # Model parameters
-TARGET_CLASS_INDEX = 0  # Which class this model is for (0 or 1)
+TARGET_CLASS_INDEX = 0
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Inference parameters
-MASK_THRESHOLD = 0.0  # Threshold for binary masks (use 0.0 for logits)
-MIN_MASK_AREA = 100  # Minimum mask area in pixels
+MASK_THRESHOLD = 0.0
+MIN_MASK_AREA = 100
+
+# ADD THESE NEW PARAMETERS:
+POINTS_PER_SIDE = 32
+PRED_IOU_THRESH = 0.88
+STABILITY_SCORE_THRESH = 0.95
+MIN_MASK_REGION_AREA = 100
 
 # Area filtering (same as training)
-MIN_MASK_AREA_ORIGINAL = [256, 100]  # Min area for [Chromis, Coris]
+MIN_MASK_AREA_ORIGINAL = [256, 100]
 
 # Class configuration
 CLASS_NAMES = {0: "Chromis chromis", 1: "Coris julis"}
-
 
 # =============================================================================
 # ARGUMENT PARSING
@@ -86,6 +91,20 @@ def parse_arguments():
                         default=MIN_MASK_AREA,
                         help='Minimum mask area in pixels')
     
+    # ADD THESE NEW PARAMETERS (from main.py):
+    parser.add_argument('--points_per_side', type=int,
+                        default=32,
+                        help='Number of points per side for grid sampling')
+    parser.add_argument('--pred_iou_thresh', type=float,
+                        default=0.88,
+                        help='IoU threshold for mask quality')
+    parser.add_argument('--stability_score_thresh', type=float,
+                        default=0.95,
+                        help='Stability score threshold')
+    parser.add_argument('--min_mask_region_area', type=int,
+                        default=100,
+                        help='Minimum mask region area')
+    
     # Class configuration
     parser.add_argument('--target_class_index', type=int,
                         default=TARGET_CLASS_INDEX,
@@ -100,7 +119,9 @@ def update_global_variables(args):
     """Update global variables with command-line arguments."""
     global MODEL_PATH, SAM2_MODEL_ID, INPUT_IMAGES_FOLDER, \
            OUTPUT_LABELS_FOLDER, OUTPUT_IMAGES_FOLDER, \
-           MASK_THRESHOLD, MIN_MASK_AREA, TARGET_CLASS_INDEX, CLASS_NAMES
+           MASK_THRESHOLD, MIN_MASK_AREA, TARGET_CLASS_INDEX, CLASS_NAMES, \
+           POINTS_PER_SIDE, PRED_IOU_THRESH, STABILITY_SCORE_THRESH, \
+           MIN_MASK_REGION_AREA
     
     MODEL_PATH = args.model_path
     SAM2_MODEL_ID = args.sam2_model_id
@@ -111,12 +132,17 @@ def update_global_variables(args):
     MIN_MASK_AREA = args.min_mask_area
     TARGET_CLASS_INDEX = args.target_class_index
     
+    # ADD THESE:
+    POINTS_PER_SIDE = args.points_per_side
+    PRED_IOU_THRESH = args.pred_iou_thresh
+    STABILITY_SCORE_THRESH = args.stability_score_thresh
+    MIN_MASK_REGION_AREA = args.min_mask_region_area
+    
     # Update class names if provided
     if args.class_names is not None:
         CLASS_NAMES = json.loads(args.class_names)
         CLASS_NAMES = {int(k): v for k, v in CLASS_NAMES.items()}
         print(f"Updated CLASS_NAMES from arguments: {CLASS_NAMES}")
-
 
 # =============================================================================
 # SAM2 Model Loading - USING OFFICIAL API
@@ -442,7 +468,7 @@ def main():
                 
                 # Generate masks using SAM2
                 masks = generate_masks_for_image(
-                    predictor, image_rgb, DEVICE, num_points=16
+                    predictor, image_rgb, DEVICE, num_points=POINTS_PER_SIDE  # Use the parameter
                 )
                 
                 print(f"  - Generated {len(masks)} masks")
