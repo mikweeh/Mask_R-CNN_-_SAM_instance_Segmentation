@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Main script that runs the complete fish segmentation pipeline:
-1. Filter COCO dataset (filter_coco.py)
-2. Train Mask R-CNN model (train.py)
-3. Convert predictions to YOLOv11 format (coco2yolo11.py)
+Main script that runs the complete SAM2 fish segmentation pipeline:
+1. Filter COCO dataset for single class (filter_coco.py)
+2. Train SAM2 model for that class (train_sam2.py)
+3. Inference with SAM2 automatic mask generation (infer_sam2.py)
 4. Combine inference labels with original YOLO labels (adapt2rbf.py)
+
+For two-class problem, this pipeline runs twice (once per class).
 """
 
 import argparse
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import os
 import json
+import shutil
 from datetime import datetime
 
 # =============================================================================
@@ -29,55 +32,48 @@ DATASET_PATH = "dataset"
 # Class names as they appear in COCO annotations
 CLASSES_TO_KEEP = ["Chromis chromis", "Coris julis"]
 
-# Mapping from COCO class IDs to YOLO class IDs (0-indexed)
-COCO_TO_YOLO_CLASS_MAPPING = {1: 0, 2: 1}
-
-# YOLO class IDs that will be replaced by inference results (for adapt2rbf.py)
+# YOLO class IDs that will be replaced by inference results (adapt2rbf.py)
 TARGET_CLASSES_FOR_REPLACEMENT = [0, 1]
 
 # =============================================================================
-# MODEL CONFIGURATION
+# SAM2 MODEL CONFIGURATION - USING HUGGING FACE
 # =============================================================================
 
-# Base model name - will be updated to ensure uniqueness
-BASE_MODEL_NAME = "m04"
-NUM_CLASSES = len(CLASSES_TO_KEEP) + 1 # +1 for background class
+# Hugging Face model ID (no need for manual checkpoint downloads)
+SAM2_MODEL_ID = "facebook/sam2-hiera-large"  # Options:
+# - "facebook/sam2-hiera-tiny"
+# - "facebook/sam2-hiera-small" 
+# - "facebook/sam2-hiera-base-plus"
+# - "facebook/sam2-hiera-large"
+# - "facebook/sam2.1-hiera-large" (newest version)
 
-# Training parameters
+# Base model names for each class
+BASE_MODEL_NAMES = {
+    0: "sam2_chromis",  # Chromis chromis
+    1: "sam2_coris"     # Coris julis
+}
+
+# Training parameters (simpler than Mask R-CNN)
+NUM_CLASSES = 1  # Binary segmentation per model
 BATCH_SIZE = 1
-NUM_EPOCHS = 200
-LEARNING_RATE = 0.0001
-IMG_SIZE = 2048
-CONFIDENCE_THRESHOLD = 0.3
-DICE_WEIGHT = 0.0
-MASK_RESOLUTION = 112
-BASE_MIN_ANCHOR = 16
+NUM_EPOCHS = 50  # Fewer epochs than Mask R-CNN
+LEARNING_RATE = 1e-5
+IMG_SIZE = 1024  # SAM2 default input size
 
-# Training options
-USE_FOCAL_DICE = False
-OVERSAMPLE_SMALL_OBJECTS = True
-USE_COPY_PASTE = True
-
-# RPN parameters
-RPN_PRE_NMS_TOP_N_TRAIN = 400
-RPN_POST_NMS_TOP_N_TRAIN = 150
-RPN_NMS_THRESH = 0.6
+# SAM2 Automatic Mask Generator parameters
+POINTS_PER_SIDE = 32
+PRED_IOU_THRESH = 0.88
+STABILITY_SCORE_THRESH = 0.95
+MIN_MASK_REGION_AREA = 100
 
 # Output configuration
 REPORT_OUTPUT_PATH = "results"
 INFERENCE_FOLDER_PATH = os.path.join(DATASET_PATH, "inference")
 
-# Inference configuration (for coco2yolo11.py)
+# Inference configuration
 INPUT_IMAGES_FOLDER = os.path.join(DATASET_PATH, "test")
 OUTPUT_LABELS_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels")
 OUTPUT_IMAGES_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "images")
-
-# =============================================================================
-# POLYGON SIMPLIFICATION CONFIGURATION
-# =============================================================================
-
-# Polygon conversion parameters
-MIN_CONTOUR_AREA = 50                   # Minimum contour area to consider
 
 # =============================================================================
 # LABEL COMBINATION CONFIGURATION
@@ -85,31 +81,35 @@ MIN_CONTOUR_AREA = 50                   # Minimum contour area to consider
 
 # Label combination configuration (for adapt2rbf.py)
 INFERENCE_LABELS_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels")
-ORIGINAL_YOLO_LABELS_FOLDER = os.path.join(DATASET_PATH, "original_yolo/test/labels")
-COMBINED_LABELS_OUTPUT_FOLDER = os.path.join(INFERENCE_FOLDER_PATH, "labels_full")
+ORIGINAL_YOLO_LABELS_FOLDER = os.path.join(DATASET_PATH,
+                                            "original_yolo/test/labels")
+COMBINED_LABELS_OUTPUT_FOLDER = os.path.join(INFERENCE_FOLDER_PATH,
+                                              "labels_full")
 UPLOAD_FOLDER = os.path.join(DATASET_PATH, "upload")
 
-# Generate class names mapping for YOLO (derived from above)
-CLASS_NAMES_MAPPING = {}
-for coco_id, yolo_id in COCO_TO_YOLO_CLASS_MAPPING.items():
-    if coco_id <= len(CLASSES_TO_KEEP):
-        CLASS_NAMES_MAPPING[yolo_id] = CLASSES_TO_KEEP[coco_id - 1]
+# Generate class names mapping for YOLO
+CLASS_NAMES_MAPPING = {i: name for i, name in enumerate(CLASSES_TO_KEEP)}
 
 # =============================================================================
 # COMMAND LINE ARGUMENT PARSING
 # =============================================================================
 
-# Parse command line arguments for execution mode
-parser = argparse.ArgumentParser(description='Fish segmentation pipeline')
-parser.add_argument('--mode', type=str, choices=['full', 'inference'], 
+parser = argparse.ArgumentParser(
+    description='SAM2 Fish segmentation pipeline'
+)
+parser.add_argument('--mode', type=str,
+                    choices=['full', 'inference', 'single_class'],
                     default='full',
-                    help='Execution mode: "full" runs all steps, '
-                         '"inference" runs only coco2yolo and adapt2rbf')
+                    help='Execution mode: "full" runs both classes, '
+                         '"inference" only inference for both classes, '
+                         '"single_class" runs one class only')
+parser.add_argument('--target_class', type=int, default=None,
+                    choices=[0, 1],
+                    help='Target class index for single_class mode (0 or 1)')
 args = parser.parse_args()
 
-
 # =============================================================================
-# MODEL NAMING LOGIC (MOVED FROM train.py)
+# MODEL NAMING LOGIC
 # =============================================================================
 
 def get_next_model_name(base_name):
@@ -117,12 +117,11 @@ def get_next_model_name(base_name):
     Get the next available model name to avoid overwriting existing models.
     
     Args:
-        base_name (str): Base name for the model (e.g., "m01")
+        base_name: Base name for the model (e.g., "sam2_chromis")
     
     Returns:
-        str: Full path to the model file (e.g., "weights/m01_1.pth")
+        Full path to the model file (e.g., "weights/sam2_chromis.pth")
     """
-    # Ensure weights directory exists
     weights_dir = "weights"
     if not os.path.exists(weights_dir):
         os.makedirs(weights_dir)
@@ -141,32 +140,13 @@ def get_next_model_name(base_name):
             return new_path
         counter += 1
 
-# =============================================================================
-# FINALIZE PATHS AFTER MODEL NAME IS DETERMINED
-# =============================================================================
-
-def initialize_paths(mode):
-    """Initialize all paths after model name is finalized."""
-    global MODEL_NAME, MODEL_WEIGHTS_PATH
-    
-    # Get the actual model name/path that will be used
-    MODEL_WEIGHTS_PATH = get_next_model_name(
-        BASE_MODEL_NAME) if mode == "full" else f"weights/{BASE_MODEL_NAME}.pth"
-    MODEL_NAME = os.path.splitext(os.path.basename(MODEL_WEIGHTS_PATH))[0]
-    
-    print(f"Model will be saved as: {MODEL_WEIGHTS_PATH}")
-    print(f"Final model name: {MODEL_NAME}")
-    
-    return MODEL_WEIGHTS_PATH
 
 # =============================================================================
 # PIPELINE FUNCTIONS
 # =============================================================================
 
 def cleanup_folder(folder_path):
-    """
-    Remove the folder to clean up previous results.
-    """
+    """Remove the folder to clean up previous results."""
     if os.path.exists(folder_path):
         print(f"Removing existing folder: {folder_path}")
         try:
@@ -177,154 +157,150 @@ def cleanup_folder(folder_path):
     else:
         print(f"No existing {folder_path} folder found.")
 
+
 def print_step_header(step_num, step_name):
-    """Print a formatted header for each pipeline step"""
+    """Print a formatted header for each pipeline step."""
     print("\n" + "="*80)
     print(f"STEP {step_num}: {step_name}")
     print("="*80)
 
+
 def print_step_footer(step_name):
-    """Print a formatted footer for each pipeline step"""
+    """Print a formatted footer for each pipeline step."""
     print("-"*80)
     print(f"{step_name} completed successfully!")
     print("-"*80)
 
-def run_filter_coco():
+
+def run_filter_coco(target_class_index):
     """
-    Run the COCO dataset filtering script.
+    Run the COCO dataset filtering script for a single class.
+    
+    Args:
+        target_class_index: Index of class to filter (0 or 1)
     """
-    print_step_header(1, "FILTERING COCO DATASET")
+    print_step_header(1, f"FILTERING COCO DATASET - CLASS "
+                      f"{CLASSES_TO_KEEP[target_class_index]}")
     print(f"Dataset path: {DATASET_PATH}")
-    print(f"Classes to keep: {CLASSES_TO_KEEP}")
+    print(f"Target class: {CLASSES_TO_KEEP[target_class_index]}")
+    print(f"Class index: {target_class_index}")
     
     try:
-        # Run filter_coco.py with dataset path and classes arguments
-        cmd = [sys.executable, "src/utils/filter_coco.py", DATASET_PATH,
-               "--classes_to_keep", json.dumps(CLASSES_TO_KEEP)]
+        # Run filter_coco.py with single class filtering
+        cmd = [
+            sys.executable, "src/utils/filter_coco.py", DATASET_PATH,
+            "--classes_to_keep", json.dumps(CLASSES_TO_KEEP),
+            "--target_class_index", str(target_class_index)
+        ]
+        
         print(f"Running command: {' '.join(cmd)}")
         result = subprocess.run(cmd, check=True)
         print_step_footer("COCO Dataset Filtering")
+        
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: COCO filtering failed with return code {e.returncode}")
+        print(f"ERROR: COCO filtering failed with return code "
+              f"{e.returncode}")
         sys.exit(1)
     except FileNotFoundError:
-        print("ERROR: src/utils/filter_coco.py not found in current directory")
+        print("ERROR: src/utils/filter_coco.py not found in current "
+              "directory")
         sys.exit(1)
 
-def run_training(model_path):
+
+def run_training_sam2(model_path, target_class_index):
     """
-    Run the training script with the finalized model path.
+    Run the SAM2 training script.
     
     Args:
-        model_path (str): Full path where the model will be saved
+        model_path: Full path where the model will be saved
+        target_class_index: Index of class being trained (0 or 1)
     """
-    print_step_header(2, "TRAINING MASK R-CNN MODEL")
+    print_step_header(2, f"TRAINING SAM2 MODEL - CLASS "
+                      f"{CLASSES_TO_KEEP[target_class_index]}")
     print(f"Model will be saved to: {model_path}")
     print(f"Number of epochs: {NUM_EPOCHS}")
-    print(f"Classes mapping: {COCO_TO_YOLO_CLASS_MAPPING}")
-    print(f"Class names: {CLASS_NAMES_MAPPING}")
+    print(f"Target class: {CLASSES_TO_KEEP[target_class_index]}")
     
     try:
-        # Build command with all training parameters including finalized model path
+        # Build command with Hugging Face model ID (no checkpoint files)
         cmd = [
-            sys.executable, "src/utils/train.py",
+            sys.executable, "src/utils/train_sam2.py",
             "--dataset_path", DATASET_PATH,
-            "--model_path", model_path,  # Pass full path instead of just name
-            "--num_classes", str(NUM_CLASSES),
-            "--batch_size", str(BATCH_SIZE),
+            "--model_path", model_path,
+            "--sam2_model_id", SAM2_MODEL_ID,  # Changed from checkpoint/config
             "--num_epochs", str(NUM_EPOCHS),
+            "--batch_size", str(BATCH_SIZE),
             "--learning_rate", str(LEARNING_RATE),
             "--img_size", str(IMG_SIZE),
-            "--confidence_threshold", str(CONFIDENCE_THRESHOLD),
-            "--dice_weight", str(DICE_WEIGHT),
-            "--mask_resolution", str(MASK_RESOLUTION),
-            "--base_min_anchor", str(BASE_MIN_ANCHOR),
-            "--rpn_pre_nms_top_n_train", str(RPN_PRE_NMS_TOP_N_TRAIN),
-            "--rpn_post_nms_top_n_train", str(RPN_POST_NMS_TOP_N_TRAIN),
-            "--rpn_nms_thresh", str(RPN_NMS_THRESH),
             "--report_output_path", REPORT_OUTPUT_PATH,
-            # Pass class configuration from main.py
-            "--class_mapping", json.dumps(COCO_TO_YOLO_CLASS_MAPPING),
-            "--class_names", json.dumps(CLASS_NAMES_MAPPING)
+            "--class_names", json.dumps(CLASS_NAMES_MAPPING),
+            "--target_class_index", str(target_class_index)
         ]
         
-        # Add boolean flags explicitly
-        if USE_FOCAL_DICE:
-            cmd.append("--use_focal_dice")
-        else:
-            cmd.append("--no_use_focal_dice")
-        
-        if OVERSAMPLE_SMALL_OBJECTS:
-            cmd.append("--oversample_small_objects")
-        else:
-            cmd.append("--no_oversample_small_objects")
-        
-        if USE_COPY_PASTE:
-            cmd.append("--use_copy_paste")
-        else:
-            cmd.append("--no_use_copy_paste")
-        
-        print(f"Running training with {len(cmd)} parameters...")
+        print(f"Running SAM2 training with {len(cmd)} parameters...")
         result = subprocess.run(cmd, check=True)
-        print_step_footer("Model Training")
+        print_step_footer("SAM2 Model Training")
         
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Training failed with return code {e.returncode}")
         sys.exit(1)
     except FileNotFoundError:
-        print("ERROR: src/utils/train.py not found in current directory")
+        print("ERROR: src/utils/train_sam2.py not found in current "
+              "directory")
         sys.exit(1)
 
-def run_coco2yolo(model_path):
+
+def run_inference_sam2(model_path, target_class_index):
     """
-    Run the COCO to YOLO conversion script with the trained model.
+    Run the SAM2 inference script.
     
     Args:
-        model_path (str): Path to the trained model
+        model_path: Path to the trained SAM2 model
+        target_class_index: Index of class for inference (0 or 1)
     """
-    print_step_header(3, "CONVERTING TO YOLOV11 FORMAT")
+    print_step_header(3, f"SAM2 INFERENCE - CLASS "
+                      f"{CLASSES_TO_KEEP[target_class_index]}")
     print(f"Using model: {model_path}")
-    print(f"Class mapping: {COCO_TO_YOLO_CLASS_MAPPING}")
+    print(f"Target class: {CLASSES_TO_KEEP[target_class_index]}")
     
     try:
-        # Build command with all inference parameters
+        # Build command with Hugging Face model ID (no checkpoint files)
         cmd = [
-            sys.executable, "src/utils/coco2yolo11.py",
-            "--model_path", model_path,  # Use the actual trained model path
+            sys.executable, "src/utils/infer_sam2.py",
+            "--model_path", model_path,
+            "--sam2_model_id", SAM2_MODEL_ID,  # Changed from checkpoint/config
             "--input_images_folder", INPUT_IMAGES_FOLDER,
             "--output_labels_folder", OUTPUT_LABELS_FOLDER,
             "--output_images_folder", OUTPUT_IMAGES_FOLDER,
-            "--num_classes", str(NUM_CLASSES),
-            "--img_size", str(IMG_SIZE),
-            "--confidence_threshold", str(CONFIDENCE_THRESHOLD),
-            "--mask_resolution", str(MASK_RESOLUTION),
-            "--base_min_anchor", str(BASE_MIN_ANCHOR),
-            # Pass class configuration from main.py
-            "--class_mapping", json.dumps(COCO_TO_YOLO_CLASS_MAPPING),
-            # Pass polygon simplification configuration
-            "--min_contour_area", str(MIN_CONTOUR_AREA),
+            "--points_per_side", str(POINTS_PER_SIDE),
+            "--pred_iou_thresh", str(PRED_IOU_THRESH),
+            "--stability_score_thresh", str(STABILITY_SCORE_THRESH),
+            "--min_mask_region_area", str(MIN_MASK_REGION_AREA),
+            "--target_class_index", str(target_class_index),
+            "--class_names", json.dumps(CLASS_NAMES_MAPPING)
         ]
         
-        print(f"Running COCO to YOLO conversion with {len(cmd)} parameters...")
+        print(f"Running SAM2 inference with {len(cmd)} parameters...")
         result = subprocess.run(cmd, check=True)
-        print_step_footer("COCO to YOLOv11 Conversion")
+        print_step_footer("SAM2 Inference")
         
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: COCO to YOLO conversion failed with return code {e.returncode}")
+        print(f"ERROR: Inference failed with return code {e.returncode}")
         sys.exit(1)
     except FileNotFoundError:
-        print("ERROR: src/utils/coco2yolo11.py not found in current directory")
+        print("ERROR: src/utils/infer_sam2.py not found in current "
+              "directory")
         sys.exit(1)
 
+
 def run_adapt2rbf():
-    """
-    Run the label combination script with class configuration.
-    """
+    """Run the label combination script."""
     print_step_header(4, "COMBINING INFERENCE WITH ORIGINAL LABELS")
-    print(f"Target classes for replacement: {TARGET_CLASSES_FOR_REPLACEMENT}")
+    print(f"Target classes for replacement: "
+          f"{TARGET_CLASSES_FOR_REPLACEMENT}")
     
     try:
-        # Build command with label combination parameters including class configuration
+        # Build command with label combination parameters
         cmd = [
             sys.executable, "src/utils/adapt2rbf.py",
             "--inference_folder", INFERENCE_LABELS_FOLDER,
@@ -340,11 +316,64 @@ def run_adapt2rbf():
         print_step_footer("Label Combination")
         
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Label combination failed with return code {e.returncode}")
+        print(f"ERROR: Label combination failed with return code "
+              f"{e.returncode}")
         sys.exit(1)
     except FileNotFoundError:
-        print("ERROR: src/utils/adapt2rbf.py not found in current directory")
+        print("ERROR: src/utils/adapt2rbf.py not found in current "
+              "directory")
         sys.exit(1)
+
+
+def merge_yolo_labels(labels_dir_class0, labels_dir_class1, output_dir):
+    """
+    Merge YOLO labels from two class-specific inference runs.
+    
+    Args:
+        labels_dir_class0: Directory with class 0 labels
+        labels_dir_class1: Directory with class 1 labels
+        output_dir: Directory to save merged labels
+    """
+    print("\n" + "-"*80)
+    print("MERGING LABELS FROM BOTH CLASSES")
+    print("-"*80)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get all label files
+    files_class0 = set(os.listdir(labels_dir_class0)) if \
+        os.path.exists(labels_dir_class0) else set()
+    files_class1 = set(os.listdir(labels_dir_class1)) if \
+        os.path.exists(labels_dir_class1) else set()
+    
+    all_files = files_class0.union(files_class1)
+    
+    for filename in all_files:
+        if not filename.endswith('.txt'):
+            continue
+        
+        merged_lines = []
+        
+        # Read class 0 labels
+        path0 = os.path.join(labels_dir_class0, filename)
+        if os.path.exists(path0):
+            with open(path0, 'r') as f:
+                merged_lines.extend(f.readlines())
+        
+        # Read class 1 labels
+        path1 = os.path.join(labels_dir_class1, filename)
+        if os.path.exists(path1):
+            with open(path1, 'r') as f:
+                merged_lines.extend(f.readlines())
+        
+        # Write merged labels
+        output_path = os.path.join(output_dir, filename)
+        with open(output_path, 'w') as f:
+            f.writelines(merged_lines)
+    
+    print(f"Merged {len(all_files)} label files")
+    print("-"*80)
+
 
 def check_prerequisites():
     """Check if all required scripts and directories exist."""
@@ -352,8 +381,8 @@ def check_prerequisites():
     
     required_scripts = [
         "src/utils/filter_coco.py",
-        "src/utils/train.py",
-        "src/utils/coco2yolo11.py",
+        "src/utils/train_sam2.py",
+        "src/utils/infer_sam2.py",
         "src/utils/adapt2rbf.py"
     ]
     
@@ -366,67 +395,167 @@ def check_prerequisites():
         print(f"ERROR: Dataset directory '{DATASET_PATH}' not found")
         sys.exit(1)
     
+    # No need to check for checkpoint files anymore - Hugging Face handles it
     print("Prerequisites check completed.")
+    print(f"SAM2 model '{SAM2_MODEL_ID}' will be downloaded automatically "
+          f"from Hugging Face on first use.")
 
-def print_pipeline_summary():
-    """Print a summary of the pipeline configuration."""
+
+def print_pipeline_summary(class_index=None):
+    """
+    Print a summary of the pipeline configuration.
+    
+    Args:
+        class_index: If specified, show config for single class only
+    """
     print("\n" + "="*80)
-    print("FISH SEGMENTATION PIPELINE CONFIGURATION")
+    print("SAM2 FISH SEGMENTATION PIPELINE CONFIGURATION")
     print("="*80)
     print(f"Dataset Path: {DATASET_PATH}")
-    print(f"Classes to Keep: {CLASSES_TO_KEEP}")
-    print(f"COCO to YOLO Class Mapping: {COCO_TO_YOLO_CLASS_MAPPING}")
+    print(f"Classes: {CLASSES_TO_KEEP}")
     print(f"Class Names Mapping: {CLASS_NAMES_MAPPING}")
-    print(f"Target Classes for Replacement: {TARGET_CLASSES_FOR_REPLACEMENT}")
-    print(f"Base Model Name: {BASE_MODEL_NAME}")
-    print(f"Actual Model Path: {MODEL_WEIGHTS_PATH}")
-    print(f"Number of Classes: {NUM_CLASSES}")
+    print(f"SAM2 Model (Hugging Face): {SAM2_MODEL_ID}")
     
-    # Add polygon simplification configuration to summary
-    print("\n" + "-"*40)
-    print("POLYGON SIMPLIFICATION CONFIGURATION")
-    print("-"*40)
-    print(f"Minimum Contour Area: {MIN_CONTOUR_AREA}")
+    if class_index is not None:
+        print(f"\nTarget Class: {CLASSES_TO_KEEP[class_index]} "
+              f"(index {class_index})")
+        model_path = get_next_model_name(BASE_MODEL_NAMES[class_index])
+        print(f"Model Path: {model_path}")
+    else:
+        print(f"\nRunning for BOTH classes:")
+        for idx in [0, 1]:
+            model_path = get_next_model_name(BASE_MODEL_NAMES[idx])
+            print(f"  Class {idx} ({CLASSES_TO_KEEP[idx]}): {model_path}")
+    
+    print(f"\nTraining Configuration:")
+    print(f"  Epochs: {NUM_EPOCHS}")
+    print(f"  Learning Rate: {LEARNING_RATE}")
+    print(f"  Image Size: {IMG_SIZE}")
     print("="*80)
+
+
+def run_single_class_pipeline(target_class_index, mode='full'):
+    """
+    Run the complete pipeline for a single class.
+    
+    Args:
+        target_class_index: Index of class to process (0 or 1)
+        mode: 'full' for complete pipeline, 'inference' for inference only
+    """
+    print("\n" + "#"*80)
+    print(f"# PROCESSING CLASS: {CLASSES_TO_KEEP[target_class_index]} "
+          f"(INDEX {target_class_index})")
+    print("#"*80)
+    
+    # Get model path for this class
+    base_name = BASE_MODEL_NAMES[target_class_index]
+    model_path = get_next_model_name(base_name) if mode == 'full' else \
+        f"weights/{base_name}.pth"
+    
+    # Create temporary output directories for this class
+    temp_labels_dir = os.path.join(INFERENCE_FOLDER_PATH,
+                                    f"labels_class{target_class_index}")
+    temp_images_dir = os.path.join(INFERENCE_FOLDER_PATH,
+                                    f"images_class{target_class_index}")
+    
+    # Update global variables temporarily
+    global OUTPUT_LABELS_FOLDER, OUTPUT_IMAGES_FOLDER
+    original_labels_folder = OUTPUT_LABELS_FOLDER
+    original_images_folder = OUTPUT_IMAGES_FOLDER
+    OUTPUT_LABELS_FOLDER = temp_labels_dir
+    OUTPUT_IMAGES_FOLDER = temp_images_dir
+    
+    try:
+        if mode == 'full':
+            # Run complete pipeline for this class
+            run_filter_coco(target_class_index)
+            run_training_sam2(model_path, target_class_index)
+        
+        # Run inference (both 'full' and 'inference' modes)
+        run_inference_sam2(model_path, target_class_index)
+        
+    finally:
+        # Restore global variables
+        OUTPUT_LABELS_FOLDER = original_labels_folder
+        OUTPUT_IMAGES_FOLDER = original_images_folder
+    
+    return temp_labels_dir, temp_images_dir
 
 
 def main():
     """Main pipeline execution function."""
     pipeline_start_time = datetime.now()
     
-    print("FISH SEGMENTATION COMPLETE PIPELINE")
+    print("\n" + "="*80)
+    print("SAM2 FISH SEGMENTATION COMPLETE PIPELINE")
+    print("="*80)
     print(f"Started at: {pipeline_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Execution mode: {args.mode}")
     
-    # Initialize model paths first
-    model_path = initialize_paths(args.mode)
-    
-    print_pipeline_summary()
     check_prerequisites()
     
     try:
-        if args.mode == 'full':
-            # Run complete pipeline
-            run_filter_coco()
-            run_training(model_path)
-            run_coco2yolo(model_path)
-            run_adapt2rbf()
-        elif args.mode == 'inference':
-            # Run only inference steps (assuming model is already trained)
-            print("Skipping filter_coco and training steps...")
+        if args.mode == 'single_class':
+            # Single class mode
+            if args.target_class is None:
+                print("ERROR: --target_class required for single_class mode")
+                sys.exit(1)
+            
+            print_pipeline_summary(class_index=args.target_class)
+            run_single_class_pipeline(args.target_class, mode='full')
+            
+            # No merging needed for single class
+            print("\nSingle class pipeline completed. Skipping merge step.")
+            
+        elif args.mode in ['full', 'inference']:
+            # Process both classes
+            print_pipeline_summary()
+            
+            if args.mode == 'full':
+                print("\nRunning FULL pipeline for BOTH classes...")
+            else:
+                print("\nRunning INFERENCE for BOTH classes...")
+            
+            # Clean up previous results
             cleanup_folder(INFERENCE_FOLDER_PATH)
             cleanup_folder(UPLOAD_FOLDER)
-            run_coco2yolo(model_path)
+            
+            # Process class 0 (Chromis chromis)
+            labels_dir_0, images_dir_0 = run_single_class_pipeline(
+                0, mode=args.mode
+            )
+            
+            # Process class 1 (Coris julis)
+            labels_dir_1, images_dir_1 = run_single_class_pipeline(
+                1, mode=args.mode
+            )
+            
+            # Merge labels from both classes
+            merge_yolo_labels(labels_dir_0, labels_dir_1,
+                              OUTPUT_LABELS_FOLDER)
+            
+            # Merge visualizations (copy both to main output folder)
+            print("\nCopying visualizations...")
+            os.makedirs(OUTPUT_IMAGES_FOLDER, exist_ok=True)
+            for img_dir in [images_dir_0, images_dir_1]:
+                if os.path.exists(img_dir):
+                    for filename in os.listdir(img_dir):
+                        src = os.path.join(img_dir, filename)
+                        dst = os.path.join(OUTPUT_IMAGES_FOLDER, filename)
+                        shutil.copy2(src, dst)
+            
+            # Run adapt2rbf to combine with original labels
             run_adapt2rbf()
         
         pipeline_end_time = datetime.now()
         duration = pipeline_end_time - pipeline_start_time
         
         print("\n" + "="*80)
-        print("!!!PIPELINE FINISHED SUCCESSFULLY!!!")
+        print("!!! PIPELINE FINISHED SUCCESSFULLY !!!")
         print("="*80)
         print(f"Total duration: {str(duration).split('.')[0]}")
-        print(f"Model path: {model_path}")
+        print(f"Combined labels: {OUTPUT_LABELS_FOLDER}")
+        print(f"Upload folder: {UPLOAD_FOLDER}")
         print("="*80)
         
     except KeyboardInterrupt:
@@ -434,9 +563,10 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"\n\nUnexpected error in pipeline: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-    # --mode inference

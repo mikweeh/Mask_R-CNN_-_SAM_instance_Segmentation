@@ -16,3 +16,4 @@ pycocotools==2.0.10
 ultralytics==8.3.154
 reportlab==4.4.1
 shapely==2.1.1
+huggingface_hub==0.35.3
