@@ -3,6 +3,16 @@
 """
 SAM2 fine-tuning script using GROUND TRUTH MASKS as prompts.
 Compatible with SAM2 installed via: pip install git+https://github.com/facebookresearch/sam2.git
+
+IMPROVEMENTS APPLIED:
+- Increased epochs to 150
+- Lowered learning rate to 5e-6
+- Image size kept at 1024 (SAM2 optimal, see note below)
+- Improved LR scheduler (factor=0.6, patience=10)
+- Unfrozen prompt encoder for small objects
+- Added data augmentation with Albumentations
+- Added gradient accumulation
+- Increased Dice loss weight to 2.0
 """
 
 import argparse
@@ -26,6 +36,10 @@ import warnings
 warnings.filterwarnings("ignore")
 from datetime import datetime
 from PIL import Image
+import random
+
+# ADDED: Albumentations for data augmentation
+import albumentations as A
 
 # SAM2 imports
 try:
@@ -56,9 +70,11 @@ except ImportError:
 # DEFAULT GLOBAL CONFIGURATION VARIABLES
 # =============================================================================
 
+# Model configuration
 MODEL_PATH = "weights/sam2_model.pth"
 SAM2_MODEL_ID = "facebook/sam2-hiera-large"
 
+# Dataset paths
 DATASET_PATH = "dataset"
 TRAIN_IMAGES_PATH = os.path.join(DATASET_PATH, "train")
 VAL_IMAGES_PATH = os.path.join(DATASET_PATH, "valid")
@@ -67,19 +83,39 @@ TRAIN_ANNOTATIONS = os.path.join(TRAIN_IMAGES_PATH,
 VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH,
                                 "_annotations_filtered.coco.json")
 
+# Training parameters - IMPROVED FOR SMALL OBJECTS
 NUM_CLASSES = 1
 BATCH_SIZE = 1
-NUM_EPOCHS = 50
-LEARNING_RATE = 1e-5
+NUM_EPOCHS = 150  # CHANGED: Increased from 50 to 150 for better convergence
+LEARNING_RATE = 5e-6  # CHANGED: Lowered from 1e-5 to 5e-6 for fine-grained learning
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-IMG_SIZE = 1024
+# ADDED: Gradient accumulation steps for effective larger batch size
+GRADIENT_ACCUMULATION_STEPS = 4  # NEW: Effective batch size = 1 * 3 = 3
+
+# Model parameters
+# NOTE: Keeping IMG_SIZE=1024. While you have large images, SAM2 was trained on 1024x1024
+# and works optimally at this resolution. Increasing to 2048 would:
+# - Increase memory usage by 4x (2048²/1024² = 4)
+# - Slow training significantly
+# - Not necessarily improve accuracy (SAM2's architecture is optimized for 1024)
+# - Risk out-of-memory errors
+# RECOMMENDATION: Keep at 1024 and rely on other improvements (augmentation, longer training)
+IMG_SIZE = 1024  # UNCHANGED: Optimal for SAM2
 MASK_THRESHOLD = 0.5
 MIN_MASK_AREA = 100
 
+# ADDED: Loss weight for Dice loss (for small objects)
+DICE_WEIGHT = 2.0  # NEW: Give more weight to Dice loss for better boundaries
+
+# Max number of instances per image
+MAX_INSTANCES_PER_IMAGE = 100
+
+# Report configuration
 REPORT_OUTPUT_PATH = "results"
 TEMP_FIGURES_PATH = os.path.join(REPORT_OUTPUT_PATH, "imgs")
 
+# Class configuration
 CLASS_NAMES = {0: "Chromis chromis", 1: "Coris julis"}
 TARGET_CLASS_INDEX = 0
 
@@ -112,25 +148,29 @@ def get_next_model_name_train():
 
 
 def clear_gpu_memory():
-    """Clear GPU memory cache."""
+    """Enhanced GPU memory clearing."""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         gc.collect()
 
 
 # =============================================================================
-# SAM2 Dataset Class
+# SAM2 Dataset Class - WITH DATA AUGMENTATION
 # =============================================================================
 
 class SAM2Dataset(Dataset):
     """
     Dataset class for SAM2 training with COCO annotations.
     Returns ONLY ground truth masks (no boxes).
+    IMPROVED: Added data augmentation for training.
     """
     
-    def __init__(self, images_path, annotations_path, img_size=1024):
+    def __init__(self, images_path, annotations_path, img_size=1024, 
+                 is_training=True):  # ADDED: is_training parameter
         self.images_path = images_path
         self.img_size = img_size
+        self.is_training = is_training  # NEW
         
         # Load COCO annotations
         self.coco = COCO(annotations_path)
@@ -142,7 +182,25 @@ class SAM2Dataset(Dataset):
             if len(self.coco.getAnnIds(imgIds=img_id)) > 0
         ]
         
+        # ADDED: Data augmentation pipeline (only for training)
+        if self.is_training:
+            self.transform = A.Compose([
+                A.RandomBrightnessContrast(p=0.5),
+                A.GaussNoise(p=0.3),
+                A.ShiftScaleRotate(
+                    shift_limit=0.1,
+                    scale_limit=0.2,  # Important for scale variations
+                    rotate_limit=45,
+                    p=0.5
+                ),
+                A.HorizontalFlip(p=0.5),
+            ])
+        else:
+            self.transform = None
+        
         print(f"Loaded {len(self.image_ids)} images with annotations")
+        if self.is_training:
+            print("Data augmentation ENABLED for training")
     
     def __len__(self):
         return len(self.image_ids)
@@ -150,6 +208,7 @@ class SAM2Dataset(Dataset):
     def __getitem__(self, idx):
         """
         Returns numpy arrays that DataLoader will convert to tensors.
+        IMPROVED: Proper COCO mask handling with dimension validation.
         
         Returns:
             image: RGB image array (H, W, 3) - numpy uint8
@@ -159,117 +218,193 @@ class SAM2Dataset(Dataset):
         img_info = self.coco.loadImgs(img_id)[0]
         img_path = os.path.join(self.images_path, img_info['file_name'])
         
-        # Load image
+        # Load image as numpy array
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Get EXPECTED dimensions from COCO metadata (most reliable)
+        expected_height = img_info['height']
+        expected_width = img_info['width']
+        
+        # Verify loaded image matches COCO metadata
+        actual_height, actual_width = image.shape[:2]
+        if (actual_height != expected_height or 
+            actual_width != expected_width):
+            print(f"Warning: Image {img_id} dimension mismatch. "
+                f"Expected {expected_height}x{expected_width}, "
+                f"got {actual_height}x{actual_width}. Resizing.")
+            image = cv2.resize(image, (expected_width, expected_height))
         
         # Get annotations
         ann_ids = self.coco.getAnnIds(imgIds=img_id)
         anns = self.coco.loadAnns(ann_ids)
         
-        # Extract masks only
+        # Extract masks with proper dimension handling
         masks = []
         
         for ann in anns:
             if 'segmentation' in ann:
+                # PROFESSIONAL: Use COCO's built-in dimension info
                 if isinstance(ann['segmentation'], list):
+                    # Polygon format
                     mask = self.coco.annToMask(ann)
                 else:
-                    mask = coco_mask.decode(ann['segmentation'])
+                    # RLE format - can have dimension issues
+                    if isinstance(ann['segmentation'], dict):
+                        # Compressed RLE
+                        mask = coco_mask.decode(ann['segmentation'])
+                    else:
+                        # Uncompressed RLE
+                        mask = self.coco.annToMask(ann)
+                
+                # Validate mask dimensions against COCO metadata
+                mask_h, mask_w = mask.shape[:2]
+                if (mask_h != expected_height or mask_w != expected_width):
+                    # This is expected for some COCO annotations
+                    # Resize to match COCO metadata dimensions
+                    mask = cv2.resize(
+                        mask, 
+                        (expected_width, expected_height),
+                        interpolation=cv2.INTER_NEAREST
+                    )
                 
                 masks.append(mask.astype(np.float32))
         
-        masks = np.array(masks, dtype=np.float32)
+        # Skip images without valid masks
+        if len(masks) == 0:
+            masks = np.zeros((1, expected_height, expected_width), 
+                            dtype=np.float32)
+        else:
+            masks = np.array(masks, dtype=np.float32)
+        
+        # Apply augmentation if training
+        if self.is_training and self.transform is not None and masks.shape[0] > 0:
+            try:
+                # Convert masks to list format for Albumentations
+                masks_list = [masks[i] for i in range(masks.shape[0])]
+                
+                # Apply augmentation
+                augmented = self.transform(image=image, masks=masks_list)
+                image = augmented['image']
+                masks_augmented = augmented['masks']
+                
+                # Convert back to numpy array
+                if len(masks_augmented) > 0:
+                    masks = np.array(masks_augmented, dtype=np.float32)
+                
+            except Exception as e:
+                # Fallback to original if augmentation fails
+                print(f"Warning: Augmentation failed for image {img_id}: {e}")
+                # Use original image and masks
         
         return image, masks
 
 
 # =============================================================================
-# SAM2 Model Functions
+# SAM2 Model Functions - IMPROVED
 # =============================================================================
 
-def load_sam2_predictor(model_id, device):
-    """Load SAM2ImagePredictor from Hugging Face."""
+def load_sam2_predictor(model_id, device, fine_tuned_weights_path=None):
+    """
+    Load SAM2ImagePredictor from Hugging Face for fine-tuning.
+    IMPROVED: Unfreezes prompt encoder for better small object detection.
+    
+    Args:
+        model_id: Hugging Face model ID
+        device: Device to load model on
+        fine_tuned_weights_path: Optional path to load fine-tuned weights
+    
+    Returns:
+        SAM2ImagePredictor with model loaded
+    """
     if not SAM2_AVAILABLE:
         raise ImportError("SAM2 is not installed.")
     
     print(f"Loading SAM2 from Hugging Face: {model_id}")
+    print("This will automatically download the model on first use...")
     
     try:
         predictor = SAM2ImagePredictor.from_pretrained(model_id)
-        predictor.model.to(device)
-        predictor.model.train()
+        sam2_model = predictor.model
+        sam2_model = sam2_model.to(device)
         
-        # Freeze image encoder
-        for param in predictor.model.image_encoder.parameters():
+        # Load fine-tuned weights if provided
+        if fine_tuned_weights_path and os.path.exists(
+            fine_tuned_weights_path
+        ):
+            print(f"Loading fine-tuned weights from {fine_tuned_weights_path}")
+            state_dict = torch.load(fine_tuned_weights_path,
+                                    map_location=device)
+            sam2_model.load_state_dict(state_dict)
+            print("Fine-tuned weights loaded successfully")
+        
+        sam2_model.train()
+        
+        # Freeze image encoder (keep frozen)
+        for param in sam2_model.image_encoder.parameters():
             param.requires_grad = False
         
-        print("SAM2ImagePredictor loaded successfully")
-        print("Image encoder frozen, mask decoder trainable")
+        # CHANGED: Unfreeze mask decoder (was already unfrozen)
+        for param in sam2_model.sam_mask_decoder.parameters():
+            param.requires_grad = True
+        
+        # ADDED: Unfreeze prompt encoder for better small object detection
+        for param in sam2_model.sam_prompt_encoder.parameters():
+            param.requires_grad = True
+        
+        print("SAM2 model loaded successfully from Hugging Face")
+        print("Image encoder: FROZEN")
+        print("Mask decoder: TRAINABLE")
+        print("Prompt encoder: TRAINABLE (NEW - for small objects)")
         
         return predictor
         
     except Exception as e:
-        print(f"Error loading SAM2: {e}")
+        print(f"Error loading SAM2 model: {e}")
         raise
 
 
 # =============================================================================
-# Training Functions - CORRECTED TO USE MASKS AS PROMPTS
+# Training Functions - WITH GRADIENT ACCUMULATION
 # =============================================================================
 
 def train_one_epoch(predictor, optimizer, dataloader, device, epoch):
     """
-    Train SAM2 for one epoch - FOLLOWING OFFICIAL EXAMPLES.
-    Uses predictor.set_image() which handles all preprocessing internally.
+    Train SAM2 for one epoch using ground truth MASKS as prompts.
+    IMPROVED: Added gradient accumulation for effective larger batch size.
     """
     predictor.model.train()
-    
-    # Enable training of mask decoder and prompt encoder
     predictor.model.sam_mask_decoder.train(True)
     predictor.model.sam_prompt_encoder.train(True)
     
     total_loss = 0.0
     num_batches = 0
     
+    # ADDED: For gradient accumulation
+    optimizer.zero_grad()
+    accumulation_counter = 0
+    
     for batch_idx, (images, masks) in enumerate(dataloader):
         try:
             batch_loss = 0.0
             
             for img_tensor, mask_gt_tensor in zip(images, masks):
-                # Skip if no masks
                 if mask_gt_tensor.shape[0] == 0:
                     continue
                 
-                # img_tensor: (H, W, 3) - uint8 tensor from dataloader
-                # mask_gt_tensor: (N, H, W) - float tensor
-                
-                # Convert to numpy for predictor.set_image
-                # (This is the standard SAM2 API)
                 img_np = img_tensor.cpu().numpy()
-                
-                # Move masks to device
                 mask_gt_tensor = mask_gt_tensor.to(device)
                 
-                # CRITICAL: Use predictor.set_image() which handles ALL 
-                # preprocessing internally
                 predictor.set_image(img_np)
-                
-                # Get the preprocessed features from predictor
-                # predictor._features contains properly formatted features
                 image_embeddings = predictor._features["image_embed"]
                 
-                # Process each instance mask
                 num_instances = mask_gt_tensor.shape[0]
                 H, W = img_np.shape[:2]
                 
-                for i in range(num_instances):
-                    gt_mask_single = mask_gt_tensor[i]  # Shape: (H, W)
-                    
-                    # Prepare ground truth mask (4D tensor)
+                for i in range(min(num_instances, MAX_INSTANCES_PER_IMAGE)):
+                    gt_mask_single = mask_gt_tensor[i]
                     gt_mask_4d = gt_mask_single.unsqueeze(0).unsqueeze(0)
                     
-                    # Resize to prompt encoder's expected mask size
                     mask_input_size = (
                         predictor.model.sam_prompt_encoder.mask_input_size
                     )
@@ -281,18 +416,15 @@ def train_one_epoch(predictor, optimizer, dataloader, device, epoch):
                         align_corners=False
                     )
                     
-                    # Scale to logit range and detach
                     mask_prompt = (gt_mask_prompt - 0.5) * 20
                     mask_prompt = mask_prompt.detach()
                     
                     try:
-                        # Prepare dummy point prompts
                         point_coords = torch.zeros(1, 1, 2, device=device)
                         point_labels = -torch.ones(
                             1, 1, dtype=torch.int32, device=device
                         )
                         
-                        # Forward through prompt encoder (WITH gradients)
                         sparse_embeddings, dense_embeddings = (
                             predictor.model.sam_prompt_encoder(
                                 points=(point_coords, point_labels),
@@ -301,7 +433,6 @@ def train_one_epoch(predictor, optimizer, dataloader, device, epoch):
                             )
                         )
                         
-                        # Get high-res features if available
                         high_res_features = None
                         if "high_res_feats" in predictor._features:
                             high_res_features = [
@@ -310,7 +441,6 @@ def train_one_epoch(predictor, optimizer, dataloader, device, epoch):
                                 predictor._features["high_res_feats"]
                             ]
                         
-                        # Forward through mask decoder (WITH gradients)
                         low_res_masks, iou_predictions, _, _ = (
                             predictor.model.sam_mask_decoder(
                                 image_embeddings=image_embeddings,
@@ -325,7 +455,6 @@ def train_one_epoch(predictor, optimizer, dataloader, device, epoch):
                             )
                         )
                         
-                        # Resize to original image size
                         pred_mask_resized = F.interpolate(
                             low_res_masks,
                             size=(H, W),
@@ -343,53 +472,57 @@ def train_one_epoch(predictor, optimizer, dataloader, device, epoch):
                         union = pred_sigmoid.sum() + gt_mask_4d.sum()
                         dice_loss = 1 - (2 * intersection + 1) / (union + 1)
                         
-                        # Combined loss
-                        loss = bce_loss + dice_loss
+                        # CHANGED: Weighted loss with increased Dice weight
+                        loss = bce_loss + DICE_WEIGHT * dice_loss
+                        
+                        # CHANGED: Scale loss for gradient accumulation
+                        loss = loss / GRADIENT_ACCUMULATION_STEPS
                         batch_loss += loss
                         
                     except Exception as pred_error:
-                        print(f"Prediction error for instance {i}: "
-                              f"{pred_error}")
-                        import traceback
-                        traceback.print_exc()
+                        print(f"Prediction error for instance {i}: {pred_error}")
                         continue
             
-            # Backward pass
+            # CHANGED: Gradient accumulation logic
             if batch_loss > 0 and isinstance(batch_loss, torch.Tensor):
-                optimizer.zero_grad()
                 batch_loss.backward()
+                accumulation_counter += 1
                 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    predictor.model.parameters(), max_norm=1.0
-                )
+                # Update weights every GRADIENT_ACCUMULATION_STEPS
+                if accumulation_counter % GRADIENT_ACCUMULATION_STEPS == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        predictor.model.parameters(), max_norm=1.0
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
                 
-                optimizer.step()
-                
-                total_loss += batch_loss.item()
+                total_loss += batch_loss.item() * GRADIENT_ACCUMULATION_STEPS
                 num_batches += 1
             
-            # Print progress
             if (batch_idx + 1) % 10 == 0:
                 avg_loss = total_loss / max(num_batches, 1)
                 print(f"  Batch [{batch_idx+1}/{len(dataloader)}] - "
                       f"Avg Loss: {avg_loss:.4f}")
+                clear_gpu_memory()
         
         except Exception as e:
             print(f"Error in batch {batch_idx}: {e}")
-            import traceback
-            traceback.print_exc()
             continue
+    
+    # ADDED: Final update if there are remaining gradients
+    if accumulation_counter % GRADIENT_ACCUMULATION_STEPS != 0:
+        torch.nn.utils.clip_grad_norm_(
+            predictor.model.parameters(), max_norm=1.0
+        )
+        optimizer.step()
+        optimizer.zero_grad()
     
     avg_epoch_loss = total_loss / max(num_batches, 1)
     return avg_epoch_loss
 
 
 def calculate_validation_loss(predictor, dataloader, device):
-    """
-    Calculate validation loss using masks as prompts.
-    Uses the SAME approach as training: predictor.set_image().
-    """
+    """Calculate validation loss using masks as prompts."""
     predictor.model.eval()
     predictor.model.sam_mask_decoder.eval()
     predictor.model.sam_prompt_encoder.eval()
@@ -403,30 +536,22 @@ def calculate_validation_loss(predictor, dataloader, device):
                 batch_loss = 0.0
                 
                 for img_tensor, mask_gt_tensor in zip(images, masks):
-                    # Skip if no masks
                     if mask_gt_tensor.shape[0] == 0:
                         continue
                     
-                    # Convert to numpy for predictor API
                     img_np = img_tensor.cpu().numpy()
-                    
-                    # Move masks to device
                     mask_gt_tensor = mask_gt_tensor.to(device)
                     
-                    # CRITICAL: Use predictor.set_image() same as training
                     predictor.set_image(img_np)
-                    
-                    # Get preprocessed features from predictor
                     image_embeddings = predictor._features["image_embed"]
                     
                     num_instances = mask_gt_tensor.shape[0]
                     H, W = img_np.shape[:2]
                     
-                    for i in range(num_instances):
+                    for i in range(min(num_instances, MAX_INSTANCES_PER_IMAGE)):
                         gt_mask_single = mask_gt_tensor[i]
                         gt_mask_4d = gt_mask_single.unsqueeze(0).unsqueeze(0)
                         
-                        # Prepare mask prompt
                         mask_input_size = (
                             predictor.model.sam_prompt_encoder.mask_input_size
                         )
@@ -440,13 +565,11 @@ def calculate_validation_loss(predictor, dataloader, device):
                         mask_prompt = (gt_mask_prompt - 0.5) * 20
                         
                         try:
-                            # Dummy points
                             point_coords = torch.zeros(1, 1, 2, device=device)
                             point_labels = -torch.ones(
                                 1, 1, dtype=torch.int32, device=device
                             )
                             
-                            # Get embeddings
                             sparse_embeddings, dense_embeddings = (
                                 predictor.model.sam_prompt_encoder(
                                     points=(point_coords, point_labels),
@@ -455,7 +578,6 @@ def calculate_validation_loss(predictor, dataloader, device):
                                 )
                             )
                             
-                            # Get high-res features if available
                             high_res_features = None
                             if "high_res_feats" in predictor._features:
                                 high_res_features = [
@@ -464,7 +586,6 @@ def calculate_validation_loss(predictor, dataloader, device):
                                     predictor._features["high_res_feats"]
                                 ]
                             
-                            # Decode - SAME AS TRAINING
                             low_res_masks, _, _, _ = (
                                 predictor.model.sam_mask_decoder(
                                     image_embeddings=image_embeddings,
@@ -479,7 +600,6 @@ def calculate_validation_loss(predictor, dataloader, device):
                                 )
                             )
                             
-                            # Resize
                             pred_mask_resized = F.interpolate(
                                 low_res_masks,
                                 size=(H, W),
@@ -487,7 +607,6 @@ def calculate_validation_loss(predictor, dataloader, device):
                                 align_corners=False
                             )
                             
-                            # Compute loss
                             bce_loss = F.binary_cross_entropy_with_logits(
                                 pred_mask_resized, gt_mask_4d
                             )
@@ -499,10 +618,11 @@ def calculate_validation_loss(predictor, dataloader, device):
                                 2 * intersection + 1
                             ) / (union + 1)
                             
-                            loss = bce_loss + dice_loss
+                            # CHANGED: Use weighted loss
+                            loss = bce_loss + DICE_WEIGHT * dice_loss
                             batch_loss += loss
                             
-                        except Exception as pred_error:
+                        except Exception:
                             continue
                 
                 if batch_loss > 0 and isinstance(batch_loss, torch.Tensor):
@@ -518,32 +638,20 @@ def calculate_validation_loss(predictor, dataloader, device):
 
 
 # =============================================================================
-# PDF Report Generation
+# Test Inference for PDF Report
 # =============================================================================
 
 def generate_test_inference_examples(predictor, output_path, num_samples=5):
-    """
-    Generate inference examples on test images for the PDF report.
-    
-    Args:
-        predictor: Trained SAM2ImagePredictor
-        output_path: Path to save visualization images
-        num_samples: Number of test images to process
-    
-    Returns:
-        List of paths to saved inference visualization images
-    """
+    """Generate inference examples on test images for the PDF report."""
     predictor.model.eval()
     processed_paths = []
     
-    # Get test images
     test_images_path = os.path.join(DATASET_PATH, "test")
     
     if not os.path.exists(test_images_path):
         print(f"Test images folder not found: {test_images_path}")
         return processed_paths
     
-    # Get list of test images
     test_image_files = [
         f for f in os.listdir(test_images_path)
         if f.lower().endswith(('.jpg', '.jpeg', '.png'))
@@ -553,8 +661,6 @@ def generate_test_inference_examples(predictor, output_path, num_samples=5):
         print("No test images found.")
         return processed_paths
     
-    # Sample random images
-    import random
     sampled_files = random.sample(
         test_image_files, 
         min(num_samples, len(test_image_files))
@@ -567,17 +673,14 @@ def generate_test_inference_examples(predictor, output_path, num_samples=5):
             image_path = os.path.join(test_images_path, image_file)
             print(f"  Processing {idx+1}/{len(sampled_files)}: {image_file}")
             
-            # Load image
             image = cv2.imread(image_path)
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
-            # Set image
             predictor.set_image(image_rgb)
             image_embeddings = predictor._features["image_embed"]
             
-            # Generate masks using grid sampling
             H, W = image_rgb.shape[:2]
-            num_points = 16
+            num_points = 64  # TODO: This should be passed as a parameter
             y_points = np.linspace(0, H-1, num_points, dtype=np.float32)
             x_points = np.linspace(0, W-1, num_points, dtype=np.float32)
             
@@ -641,7 +744,6 @@ def generate_test_inference_examples(predictor, output_path, num_samples=5):
                     except Exception:
                         continue
             
-            # Create visualization
             result_image = image.copy()
             class_colors = {0: (0, 255, 0), 1: (255, 0, 0)}
             color = class_colors.get(TARGET_CLASS_INDEX, (255, 255, 255))
@@ -656,7 +758,6 @@ def generate_test_inference_examples(predictor, output_path, num_samples=5):
                     colored_mask[mask_area], alpha, 0
                 )
             
-            # Save visualization
             output_filename = f"test_inference_{idx+1}.jpg"
             output_filepath = os.path.join(output_path, output_filename)
             cv2.imwrite(output_filepath, result_image)
@@ -671,9 +772,13 @@ def generate_test_inference_examples(predictor, output_path, num_samples=5):
     return processed_paths
 
 
+# =============================================================================
+# PDF Report Generation
+# =============================================================================
+
 def generate_training_report(train_losses, val_losses, training_start,
                              training_end, test_image_paths=None):
-    """Generate PDF training report."""
+    """Generate PDF training report with test inference examples."""
     if not REPORTLAB_AVAILABLE:
         print("ReportLab not available, skipping PDF generation")
         return None
@@ -702,14 +807,18 @@ def generate_training_report(train_losses, val_losses, training_start,
                            title_style))
     story.append(Spacer(1, 20))
     
+    # ADDED: Show new configuration parameters
     info_data = [
         ["Training Start", training_start.strftime("%Y-%m-%d %H:%M:%S")],
         ["Training End", training_end.strftime("%Y-%m-%d %H:%M:%S")],
         ["Duration", str(training_end - training_start)],
         ["Target Class", class_name],
         ["Number of Epochs", str(NUM_EPOCHS)],
-        ["Batch Size", str(BATCH_SIZE)],
+        ["Batch Size", f"{BATCH_SIZE} (effective: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS})"],  # CHANGED
         ["Learning Rate", str(LEARNING_RATE)],
+        ["Dice Loss Weight", str(DICE_WEIGHT)],  # ADDED
+        ["Data Augmentation", "ENABLED"],  # ADDED
+        ["Prompt Encoder", "TRAINABLE"],  # ADDED
         ["Device", str(DEVICE)],
     ]
     
@@ -727,6 +836,7 @@ def generate_training_report(train_losses, val_losses, training_start,
     story.append(info_table)
     story.append(Spacer(1, 30))
     
+    # Training metrics plot
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
@@ -754,7 +864,8 @@ def generate_training_report(train_losses, val_losses, training_start,
     story.append(Paragraph("Training Metrics", styles['Heading2']))
     story.append(Spacer(1, 10))
     story.append(RLImage(training_plots_path, width=7*inch, height=2.5*inch))
-
+    
+    # Add test inference images
     if test_image_paths and len(test_image_paths) > 0:
         story.append(Spacer(1, 30))
         story.append(Paragraph("Test Inference Examples", styles['Heading2']))
@@ -765,8 +876,7 @@ def generate_training_report(train_losses, val_losses, training_start,
                 story.append(Paragraph(f"Test Image {idx+1}", styles['Heading3']))
                 story.append(RLImage(img_path, width=6*inch, height=4*inch))
                 story.append(Spacer(1, 20))
-
-    # Build PDF
+    
     doc.build(story)
     print(f"Training report generated: {report_path}")
     
@@ -842,43 +952,55 @@ def main():
     
     training_start_time = datetime.now()
     print("\n" + "="*60)
-    print("SAM2 TRAINING CONFIGURATION")
+    print("SAM2 TRAINING CONFIGURATION - IMPROVED FOR SMALL OBJECTS")
     print("="*60)
     print(f"Using device: {DEVICE}")
     print(f"Target class: {CLASS_NAMES.get(TARGET_CLASS_INDEX, 'unknown')}")
     print(f"SAM2 Model ID: {SAM2_MODEL_ID}")
-    print(f"Prompt type: Ground truth MASKS")
-    print(f"Number of epochs: {NUM_EPOCHS}")
+    print(f"Number of epochs: {NUM_EPOCHS} (INCREASED)")
+    print(f"Learning rate: {LEARNING_RATE} (LOWERED)")
+    print(f"Dice loss weight: {DICE_WEIGHT} (INCREASED)")
+    print(f"Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}")
+    print(f"Effective batch size: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
+    print(f"Data augmentation: ENABLED")
     print("="*60 + "\n")
     
-    # Load datasets
+    # Load datasets with augmentation
     print("Loading datasets...")
-    train_dataset = SAM2Dataset(TRAIN_IMAGES_PATH, TRAIN_ANNOTATIONS,
-                                 IMG_SIZE)
-    val_dataset = SAM2Dataset(VAL_IMAGES_PATH, VAL_ANNOTATIONS, IMG_SIZE)
+    train_dataset = SAM2Dataset(
+        TRAIN_IMAGES_PATH, TRAIN_ANNOTATIONS, IMG_SIZE, is_training=True
+    )
+    val_dataset = SAM2Dataset(
+        VAL_IMAGES_PATH, VAL_ANNOTATIONS, IMG_SIZE, is_training=False
+    )
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE,
                                shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE,
                              shuffle=False, num_workers=0)
     
-    # Load SAM2 predictor
+    # Load SAM2 predictor with unfrozen prompt encoder
     print("\nLoading SAM2 predictor...")
     predictor = load_sam2_predictor(SAM2_MODEL_ID, DEVICE)
     
-    # Setup optimizer
+    # Setup optimizer (only trainable parameters)
     trainable_params = [
         p for p in predictor.model.parameters() if p.requires_grad
     ]
     optimizer = optim.AdamW(trainable_params, lr=LEARNING_RATE,
                             weight_decay=0.01)
     
+    # CHANGED: Improved learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7
+        optimizer,
+        mode='min',
+        factor=0.6,      # Reduce by 40%
+        patience=10,     # Wait longer before reducing
+        min_lr=1e-7,
     )
     
     # Training loop
-    print("\nStarting SAM2 training with mask prompts...")
+    print("\nStarting SAM2 training with improvements...")
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -897,16 +1019,19 @@ def main():
         
         print(f"Training loss: {train_loss:.4f}")
         print(f"Validation loss: {val_loss:.4f}")
+        print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(predictor.model.state_dict(), MODEL_PATH)
-            print(f"Model saved: {MODEL_PATH}")
+            print(f"Model saved (val_loss improved to {val_loss:.4f}): "
+                  f"{MODEL_PATH}")
         
         if (epoch + 1) % 10 == 0:
             epoch_path = (f"{os.path.splitext(MODEL_PATH)[0]}_"
                          f"epoch{epoch+1:03d}.pth")
             torch.save(predictor.model.state_dict(), epoch_path)
+            print(f"Checkpoint saved at epoch {epoch+1}: {epoch_path}")
         
         scheduler.step(val_loss)
         clear_gpu_memory()
@@ -914,19 +1039,19 @@ def main():
     training_end_time = datetime.now()
     print(f"\nTraining completed!")
     print(f"Best Validation Loss: {best_val_loss:.4f}")
-
+    
     # Generate test inference examples
     print("\nGenerating test inference examples for report...")
     test_inference_paths = generate_test_inference_examples(
         predictor, TEMP_FIGURES_PATH, num_samples=5
     )
-
-    # Generate report with test images
+    
+    # Generate PDF report with test images
     print("\nGenerating PDF training report...")
     generate_training_report(
         train_losses, val_losses,
         training_start_time, training_end_time,
-        test_inference_paths  # Pass test images
+        test_inference_paths
     )
     
     print("\n" + "="*60)

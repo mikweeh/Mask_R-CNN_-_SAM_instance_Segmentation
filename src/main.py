@@ -39,13 +39,8 @@ TARGET_CLASSES_FOR_REPLACEMENT = [0, 1]
 # SAM2 MODEL CONFIGURATION - USING HUGGING FACE
 # =============================================================================
 
-# Hugging Face model ID (no need for manual checkpoint downloads)
-SAM2_MODEL_ID = "facebook/sam2-hiera-large"  # Options:
-# - "facebook/sam2-hiera-tiny"
-# - "facebook/sam2-hiera-small" 
-# - "facebook/sam2-hiera-base-plus"
-# - "facebook/sam2-hiera-large"
-# - "facebook/sam2.1-hiera-large" (newest version)
+# CHANGED: Using SAM 2.1 - Latest version with improvements
+SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"  # Was: "facebook/sam2-hiera-large"
 
 # Base model names for each class
 BASE_MODEL_NAMES = {
@@ -56,15 +51,15 @@ BASE_MODEL_NAMES = {
 # Training parameters (simpler than Mask R-CNN)
 NUM_CLASSES = 1  # Binary segmentation per model
 BATCH_SIZE = 1
-NUM_EPOCHS = 50  # Fewer epochs than Mask R-CNN
-LEARNING_RATE = 1e-5
+NUM_EPOCHS = 300  # CHANGED: Increased from 50 to 150
+LEARNING_RATE = 5e-6  # CHANGED: Lowered from 1e-5 to 5e-6
 IMG_SIZE = 1024  # SAM2 default input size
 
 # SAM2 Automatic Mask Generator parameters
-POINTS_PER_SIDE = 32
-PRED_IOU_THRESH = 0.88
-STABILITY_SCORE_THRESH = 0.95
-MIN_MASK_REGION_AREA = 100
+POINTS_PER_SIDE = 64  # CHANGED: Increased from 32 to 64
+PRED_IOU_THRESH = 0.85  # CHANGED: Lowered from 0.88 to 0.85
+STABILITY_SCORE_THRESH = 0.90  # CHANGED: Lowered from 0.95 to 0.90
+MIN_MASK_REGION_AREA = 50  # CHANGED: Lowered from 100 to 50
 
 # Output configuration
 REPORT_OUTPUT_PATH = "results"
@@ -97,6 +92,7 @@ CLASS_NAMES_MAPPING = {i: name for i, name in enumerate(CLASSES_TO_KEEP)}
 parser = argparse.ArgumentParser(
     description='SAM2 Fish segmentation pipeline'
 )
+
 parser.add_argument('--mode', type=str,
                     choices=['full', 'inference', 'single_class'],
                     default='full',
@@ -106,6 +102,7 @@ parser.add_argument('--mode', type=str,
 parser.add_argument('--target_class', type=int, default=None,
                     choices=[0, 1],
                     help='Target class index for single_class mode (0 or 1)')
+
 args = parser.parse_args()
 
 # =============================================================================
@@ -222,15 +219,15 @@ def run_training_sam2(model_path, target_class_index):
     print(f"Target class: {CLASSES_TO_KEEP[target_class_index]}")
     
     try:
-        # Build command with Hugging Face model ID (no checkpoint files)
+        # Build command with Hugging Face model ID
         cmd = [
             sys.executable, "src/utils/train_sam2.py",
             "--dataset_path", DATASET_PATH,
             "--model_path", model_path,
-            "--sam2_model_id", SAM2_MODEL_ID,  # Changed from checkpoint/config
-            "--num_epochs", str(NUM_EPOCHS),
+            "--sam2_model_id", SAM2_MODEL_ID,  # UNCHANGED: passes SAM2_MODEL_ID
+            "--num_epochs", str(NUM_EPOCHS),  # CHANGED: Now passes 150
             "--batch_size", str(BATCH_SIZE),
-            "--learning_rate", str(LEARNING_RATE),
+            "--learning_rate", str(LEARNING_RATE),  # CHANGED: Now passes 5e-6
             "--img_size", str(IMG_SIZE),
             "--report_output_path", REPORT_OUTPUT_PATH,
             "--class_names", json.dumps(CLASS_NAMES_MAPPING),
@@ -264,18 +261,18 @@ def run_inference_sam2(model_path, target_class_index):
     print(f"Target class: {CLASSES_TO_KEEP[target_class_index]}")
     
     try:
-        # Build command with Hugging Face model ID (no checkpoint files)
+        # Build command with Hugging Face model ID
         cmd = [
             sys.executable, "src/utils/infer_sam2.py",
             "--model_path", model_path,
-            "--sam2_model_id", SAM2_MODEL_ID,  # Changed from checkpoint/config
+            "--sam2_model_id", SAM2_MODEL_ID,  # UNCHANGED: passes SAM2_MODEL_ID
             "--input_images_folder", INPUT_IMAGES_FOLDER,
             "--output_labels_folder", OUTPUT_LABELS_FOLDER,
             "--output_images_folder", OUTPUT_IMAGES_FOLDER,
-            "--points_per_side", str(POINTS_PER_SIDE),
-            "--pred_iou_thresh", str(PRED_IOU_THRESH),
-            "--stability_score_thresh", str(STABILITY_SCORE_THRESH),
-            "--min_mask_region_area", str(MIN_MASK_REGION_AREA),
+            "--points_per_side", str(POINTS_PER_SIDE),  # CHANGED: Now passes 64
+            "--pred_iou_thresh", str(PRED_IOU_THRESH),  # CHANGED: Now passes 0.85
+            "--stability_score_thresh", str(STABILITY_SCORE_THRESH),  # CHANGED: Now passes 0.90
+            "--min_mask_region_area", str(MIN_MASK_REGION_AREA),  # CHANGED: Now passes 50
             "--target_class_index", str(target_class_index),
             "--class_names", json.dumps(CLASS_NAMES_MAPPING)
         ]
@@ -345,7 +342,6 @@ def merge_yolo_labels(labels_dir_class0, labels_dir_class1, output_dir):
         os.path.exists(labels_dir_class0) else set()
     files_class1 = set(os.listdir(labels_dir_class1)) if \
         os.path.exists(labels_dir_class1) else set()
-    
     all_files = files_class0.union(files_class1)
     
     for filename in all_files:
@@ -395,7 +391,6 @@ def check_prerequisites():
         print(f"ERROR: Dataset directory '{DATASET_PATH}' not found")
         sys.exit(1)
     
-    # No need to check for checkpoint files anymore - Hugging Face handles it
     print("Prerequisites check completed.")
     print(f"SAM2 model '{SAM2_MODEL_ID}' will be downloaded automatically "
           f"from Hugging Face on first use.")
@@ -454,14 +449,15 @@ def run_single_class_pipeline(target_class_index, mode='full'):
     
     # Create temporary output directories for this class
     temp_labels_dir = os.path.join(INFERENCE_FOLDER_PATH,
-                                    f"labels_class{target_class_index}")
+                                     f"labels_class{target_class_index}")
     temp_images_dir = os.path.join(INFERENCE_FOLDER_PATH,
-                                    f"images_class{target_class_index}")
+                                     f"images_class{target_class_index}")
     
     # Update global variables temporarily
     global OUTPUT_LABELS_FOLDER, OUTPUT_IMAGES_FOLDER
     original_labels_folder = OUTPUT_LABELS_FOLDER
     original_images_folder = OUTPUT_IMAGES_FOLDER
+    
     OUTPUT_LABELS_FOLDER = temp_labels_dir
     OUTPUT_IMAGES_FOLDER = temp_images_dir
     
@@ -537,6 +533,7 @@ def main():
             # Merge visualizations (copy both to main output folder)
             print("\nCopying visualizations...")
             os.makedirs(OUTPUT_IMAGES_FOLDER, exist_ok=True)
+            
             for img_dir in [images_dir_0, images_dir_1]:
                 if os.path.exists(img_dir):
                     for filename in os.listdir(img_dir):
@@ -557,7 +554,7 @@ def main():
         print(f"Combined labels: {OUTPUT_LABELS_FOLDER}")
         print(f"Upload folder: {UPLOAD_FOLDER}")
         print("="*80)
-        
+
     except KeyboardInterrupt:
         print("\n\nPipeline interrupted by user (Ctrl+C)")
         sys.exit(1)

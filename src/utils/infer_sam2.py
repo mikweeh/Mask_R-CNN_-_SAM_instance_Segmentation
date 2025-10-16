@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 SAM2 inference script for binary fish segmentation.
-Uses SAM2ImagePredictor with proper API (predictor.set_image()).
+Uses SAM2AutomaticMaskGenerator for proper mask generation.
 Outputs masks in YOLOv11 format.
+
+UPDATED: Now uses SAM2AutomaticMaskGenerator instead of exhaustive grid sampling
+for reasonable number of meaningful masks (~10-100 instead of ~4000).
 """
 
 import argparse
@@ -19,6 +22,7 @@ import json
 try:
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
     SAM2_AVAILABLE = True
 except ImportError:
     print("WARNING: SAM2 not available. Install with:")
@@ -46,7 +50,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MASK_THRESHOLD = 0.0
 MIN_MASK_AREA = 100
 
-# ADD THESE NEW PARAMETERS:
+# Parameters for SAM2AutomaticMaskGenerator
 POINTS_PER_SIDE = 32
 PRED_IOU_THRESH = 0.88
 STABILITY_SCORE_THRESH = 0.95
@@ -91,7 +95,7 @@ def parse_arguments():
                         default=MIN_MASK_AREA,
                         help='Minimum mask area in pixels')
     
-    # ADD THESE NEW PARAMETERS (from main.py):
+    # Parameters from main.py
     parser.add_argument('--points_per_side', type=int,
                         default=32,
                         help='Number of points per side for grid sampling')
@@ -132,7 +136,7 @@ def update_global_variables(args):
     MIN_MASK_AREA = args.min_mask_area
     TARGET_CLASS_INDEX = args.target_class_index
     
-    # ADD THESE:
+    # Update new parameters
     POINTS_PER_SIDE = args.points_per_side
     PRED_IOU_THRESH = args.pred_iou_thresh
     STABILITY_SCORE_THRESH = args.stability_score_thresh
@@ -144,13 +148,14 @@ def update_global_variables(args):
         CLASS_NAMES = {int(k): v for k, v in CLASS_NAMES.items()}
         print(f"Updated CLASS_NAMES from arguments: {CLASS_NAMES}")
 
+
 # =============================================================================
-# SAM2 Model Loading - USING OFFICIAL API
+# SAM2 Model Loading - USING AUTOMATIC MASK GENERATOR
 # =============================================================================
 
-def load_sam2_predictor(model_id, fine_tuned_weights_path, device):
+def load_sam2_mask_generator(model_id, fine_tuned_weights_path, device):
     """
-    Load SAM2ImagePredictor from Hugging Face.
+    Load SAM2AutomaticMaskGenerator for proper mask generation.
     
     Args:
         model_id: Hugging Face model ID
@@ -158,37 +163,40 @@ def load_sam2_predictor(model_id, fine_tuned_weights_path, device):
         device: Device to load model on
     
     Returns:
-        SAM2ImagePredictor instance
+        SAM2AutomaticMaskGenerator instance
     """
     if not SAM2_AVAILABLE:
         raise ImportError("SAM2 is not installed.")
     
-    print(f"Loading SAM2 from Hugging Face: {model_id}")
+    print(f"Loading SAM2 Automatic Mask Generator from: {model_id}")
     
     try:
-        # Load predictor from Hugging Face
-        predictor = SAM2ImagePredictor.from_pretrained(model_id)
-        predictor.model.to(device)
+        # Build the model first
+        sam2_model = build_sam2(model_id, fine_tuned_weights_path, device=device)
         
         # Load fine-tuned weights if available
         if os.path.exists(fine_tuned_weights_path):
-            print(f"Loading fine-tuned weights from "
-                  f"{fine_tuned_weights_path}")
-            state_dict = torch.load(fine_tuned_weights_path,
-                                    map_location=device)
-            predictor.model.load_state_dict(state_dict)
+            print(f"Loading fine-tuned weights from {fine_tuned_weights_path}")
+            state_dict = torch.load(fine_tuned_weights_path, map_location=device)
+            sam2_model.load_state_dict(state_dict)
             print("Fine-tuned weights loaded successfully")
         else:
-            print(f"WARNING: Fine-tuned weights not found at "
-                  f"{fine_tuned_weights_path}")
+            print(f"WARNING: Fine-tuned weights not found at {fine_tuned_weights_path}")
             print("Using base SAM2 model without fine-tuning")
         
-        # Set to eval mode for inference
-        predictor.model.eval()
+        # Create the automatic mask generator with optimized parameters
+        mask_generator = SAM2AutomaticMaskGenerator(
+            model=sam2_model,
+            points_per_side=POINTS_PER_SIDE,
+            pred_iou_thresh=PRED_IOU_THRESH,
+            stability_score_thresh=STABILITY_SCORE_THRESH,
+            crop_n_layers=1,
+            crop_n_points_downscale_factor=2,
+            min_mask_region_area=MIN_MASK_REGION_AREA,
+        )
         
-        print("SAM2ImagePredictor loaded successfully")
-        
-        return predictor
+        print("SAM2AutomaticMaskGenerator loaded successfully")
+        return mask_generator
         
     except Exception as e:
         print(f"Error loading SAM2: {e}")
@@ -196,102 +204,36 @@ def load_sam2_predictor(model_id, fine_tuned_weights_path, device):
 
 
 # =============================================================================
-# Mask Processing Functions
+# Mask Processing Functions - USING AUTOMATIC MASK GENERATOR
 # =============================================================================
 
-def generate_masks_for_image(predictor, image_np, device, num_points=32):
+def generate_masks_for_image(mask_generator, image_np):
     """
-    Generate masks for an image using grid sampling.
-    Uses the SAME approach as training: predictor.set_image().
+    Generate masks using SAM2's automatic mask generator.
+    This gives you only meaningful objects, not every possible mask.
     
     Args:
-        predictor: SAM2ImagePredictor instance
+        mask_generator: SAM2AutomaticMaskGenerator instance
         image_np: Image as numpy array (H, W, 3)
-        device: Device
-        num_points: Number of points per side for grid sampling
     
     Returns:
-        List of masks (as numpy arrays)
+        List of meaningful masks
     """
-    # Set image using official API
-    predictor.set_image(image_np)
+    # Use SAM2's automatic mask generator
+    masks = mask_generator.generate(image_np)
     
-    # Get image dimensions
-    H, W = image_np.shape[:2]
+    # Extract just the mask arrays (masks contain metadata too)
+    mask_arrays = []
     
-    # Get preprocessed features
-    image_embeddings = predictor._features["image_embed"]
+    for mask_data in masks:
+        # Each mask_data is a dict with 'segmentation', 'area', 'bbox', etc.
+        binary_mask = mask_data['segmentation'].astype(np.uint8)
+        
+        # Apply area filter
+        if binary_mask.sum() >= MIN_MASK_AREA:
+            mask_arrays.append(binary_mask)
     
-    # Generate grid of points
-    y_points = np.linspace(0, H-1, num_points, dtype=np.float32)
-    x_points = np.linspace(0, W-1, num_points, dtype=np.float32)
-    
-    masks = []
-    
-    for y in y_points:
-        for x in x_points:
-            # Prepare point prompt
-            point_coords = torch.tensor(
-                [[[x, y]]], dtype=torch.float32, device=device
-            )
-            point_labels = torch.ones(
-                (1, 1), dtype=torch.int32, device=device
-            )
-            
-            try:
-                # Get embeddings from prompt encoder
-                sparse_embeddings, dense_embeddings = (
-                    predictor.model.sam_prompt_encoder(
-                        points=(point_coords, point_labels),
-                        boxes=None,
-                        masks=None,
-                    )
-                )
-                
-                # Get high-res features if available
-                high_res_features = None
-                if "high_res_feats" in predictor._features:
-                    high_res_features = [
-                        feat_level[-1].unsqueeze(0) 
-                        for feat_level in 
-                        predictor._features["high_res_feats"]
-                    ]
-                
-                # Decode mask
-                with torch.no_grad():
-                    low_res_masks, _, _, _ = (
-                        predictor.model.sam_mask_decoder(
-                            image_embeddings=image_embeddings,
-                            image_pe=(
-                                predictor.model.sam_prompt_encoder.get_dense_pe()
-                            ),
-                            sparse_prompt_embeddings=sparse_embeddings,
-                            dense_prompt_embeddings=dense_embeddings,
-                            multimask_output=False,
-                            repeat_image=False,
-                            high_res_features=high_res_features,
-                        )
-                    )
-                
-                # Resize to original size
-                pred_mask = F.interpolate(
-                    low_res_masks,
-                    size=(H, W),
-                    mode='bilinear',
-                    align_corners=False
-                )
-                
-                # Convert to binary mask
-                mask_np = (torch.sigmoid(pred_mask) > 0.5).cpu().numpy()[0, 0]
-                
-                # Filter by area
-                if mask_np.sum() >= MIN_MASK_AREA:
-                    masks.append(mask_np.astype(np.uint8))
-                    
-            except Exception as e:
-                continue
-    
-    return masks
+    return mask_arrays
 
 
 def mask_to_polygon(mask, min_points=6):
@@ -430,7 +372,7 @@ def main():
     update_global_variables(args)
     
     print("\n" + "="*60)
-    print("SAM2 INFERENCE CONFIGURATION")
+    print("SAM2 INFERENCE CONFIGURATION - USING AUTOMATIC MASK GENERATOR")
     print("="*60)
     print(f"Using device: {DEVICE}")
     print(f"Target class: {CLASS_NAMES.get(TARGET_CLASS_INDEX, 'unknown')}")
@@ -438,15 +380,20 @@ def main():
     print(f"Input images folder: {INPUT_IMAGES_FOLDER}")
     print(f"Output labels folder: {OUTPUT_LABELS_FOLDER}")
     print(f"Output images folder: {OUTPUT_IMAGES_FOLDER}")
+    print(f"\nMask Generator Parameters:")
+    print(f"  Points per side: {POINTS_PER_SIDE}")
+    print(f"  Pred IoU threshold: {PRED_IOU_THRESH}")
+    print(f"  Stability score threshold: {STABILITY_SCORE_THRESH}")
+    print(f"  Min mask region area: {MIN_MASK_REGION_AREA}")
     print("="*60 + "\n")
     
     # Create output folders
     os.makedirs(OUTPUT_LABELS_FOLDER, exist_ok=True)
     os.makedirs(OUTPUT_IMAGES_FOLDER, exist_ok=True)
     
-    # Load SAM2 predictor
-    print("Loading SAM2 predictor...")
-    predictor = load_sam2_predictor(SAM2_MODEL_ID, MODEL_PATH, DEVICE)
+    # Load SAM2 automatic mask generator
+    print("Loading SAM2 Automatic Mask Generator...")
+    mask_generator = load_sam2_mask_generator(SAM2_MODEL_ID, MODEL_PATH, DEVICE)
     
     # Get minimum area for this class
     min_area = MIN_MASK_AREA_ORIGINAL[TARGET_CLASS_INDEX]
@@ -466,12 +413,10 @@ def main():
                 image = cv2.imread(image_path)
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 
-                # Generate masks using SAM2
-                masks = generate_masks_for_image(
-                    predictor, image_rgb, DEVICE, num_points=POINTS_PER_SIDE  # Use the parameter
-                )
+                # Generate masks using automatic mask generator
+                masks = generate_masks_for_image(mask_generator, image_rgb)
                 
-                print(f"  - Generated {len(masks)} masks")
+                print(f"  - Generated {len(masks)} meaningful masks")
                 
                 # Convert to YOLO format
                 yolo_annotations = convert_masks_to_yolo(
