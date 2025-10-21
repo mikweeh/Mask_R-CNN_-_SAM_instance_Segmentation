@@ -10,6 +10,10 @@ Main script that runs the complete SAM2 fish segmentation pipeline:
 For two-class problem, this pipeline runs twice (once per class).
 """
 
+# =============================================================================
+# IMPORTS
+# =============================================================================
+
 import argparse
 import subprocess
 import sys
@@ -39,8 +43,8 @@ TARGET_CLASSES_FOR_REPLACEMENT = [0, 1]
 # SAM2 MODEL CONFIGURATION - USING HUGGING FACE
 # =============================================================================
 
-# CHANGED: Using SAM 2.1 - Latest version with improvements
-SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"  # Was: "facebook/sam2-hiera-large"
+# Using SAM 2.1
+SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"
 
 # Base model names for each class
 BASE_MODEL_NAMES = {
@@ -51,15 +55,18 @@ BASE_MODEL_NAMES = {
 # Training parameters (simpler than Mask R-CNN)
 NUM_CLASSES = 1  # Binary segmentation per model
 BATCH_SIZE = 1
-NUM_EPOCHS = 300  # CHANGED: Increased from 50 to 150
-LEARNING_RATE = 5e-6  # CHANGED: Lowered from 1e-5 to 5e-6
+NUM_EPOCHS = 300
+LEARNING_RATE = 5e-6
 IMG_SIZE = 1024  # SAM2 default input size
+GRADIENT_ACCUMULATION_STEPS = 4
+DICE_WEIGHT = 2.0
+MAX_INSTANCES_PER_IMAGE = 100
 
 # SAM2 Automatic Mask Generator parameters
-POINTS_PER_SIDE = 64  # CHANGED: Increased from 32 to 64
-PRED_IOU_THRESH = 0.85  # CHANGED: Lowered from 0.88 to 0.85
-STABILITY_SCORE_THRESH = 0.90  # CHANGED: Lowered from 0.95 to 0.90
-MIN_MASK_REGION_AREA = 50  # CHANGED: Lowered from 100 to 50
+POINTS_PER_SIDE = 32
+PRED_IOU_THRESH = 0.88
+STABILITY_SCORE_THRESH = 0.95
+MIN_MASK_REGION_AREA = 100
 
 # Output configuration
 REPORT_OUTPUT_PATH = "results"
@@ -205,13 +212,7 @@ def run_filter_coco(target_class_index):
 
 
 def run_training_sam2(model_path, target_class_index):
-    """
-    Run the SAM2 training script.
-    
-    Args:
-        model_path: Full path where the model will be saved
-        target_class_index: Index of class being trained (0 or 1)
-    """
+    """Run the SAM2 training script."""
     print_step_header(2, f"TRAINING SAM2 MODEL - CLASS "
                       f"{CLASSES_TO_KEEP[target_class_index]}")
     print(f"Model will be saved to: {model_path}")
@@ -224,14 +225,17 @@ def run_training_sam2(model_path, target_class_index):
             sys.executable, "src/utils/train_sam2.py",
             "--dataset_path", DATASET_PATH,
             "--model_path", model_path,
-            "--sam2_model_id", SAM2_MODEL_ID,  # UNCHANGED: passes SAM2_MODEL_ID
-            "--num_epochs", str(NUM_EPOCHS),  # CHANGED: Now passes 150
+            "--sam2_model_id", SAM2_MODEL_ID,
+            "--num_epochs", str(NUM_EPOCHS),
             "--batch_size", str(BATCH_SIZE),
-            "--learning_rate", str(LEARNING_RATE),  # CHANGED: Now passes 5e-6
+            "--learning_rate", str(LEARNING_RATE),
             "--img_size", str(IMG_SIZE),
             "--report_output_path", REPORT_OUTPUT_PATH,
             "--class_names", json.dumps(CLASS_NAMES_MAPPING),
-            "--target_class_index", str(target_class_index)
+            "--target_class_index", str(target_class_index),
+            "--gradient_accumulation_steps", str(GRADIENT_ACCUMULATION_STEPS),
+            "--dice_weight", str(DICE_WEIGHT),
+            "--max_instances_per_image", str(MAX_INSTANCES_PER_IMAGE)
         ]
         
         print(f"Running SAM2 training with {len(cmd)} parameters...")
@@ -242,8 +246,7 @@ def run_training_sam2(model_path, target_class_index):
         print(f"ERROR: Training failed with return code {e.returncode}")
         sys.exit(1)
     except FileNotFoundError:
-        print("ERROR: src/utils/train_sam2.py not found in current "
-              "directory")
+        print("ERROR: src/utils/train_sam2.py not found in current directory")
         sys.exit(1)
 
 
@@ -265,14 +268,14 @@ def run_inference_sam2(model_path, target_class_index):
         cmd = [
             sys.executable, "src/utils/infer_sam2.py",
             "--model_path", model_path,
-            "--sam2_model_id", SAM2_MODEL_ID,  # UNCHANGED: passes SAM2_MODEL_ID
+            "--sam2_model_id", SAM2_MODEL_ID,
             "--input_images_folder", INPUT_IMAGES_FOLDER,
             "--output_labels_folder", OUTPUT_LABELS_FOLDER,
             "--output_images_folder", OUTPUT_IMAGES_FOLDER,
-            "--points_per_side", str(POINTS_PER_SIDE),  # CHANGED: Now passes 64
-            "--pred_iou_thresh", str(PRED_IOU_THRESH),  # CHANGED: Now passes 0.85
-            "--stability_score_thresh", str(STABILITY_SCORE_THRESH),  # CHANGED: Now passes 0.90
-            "--min_mask_region_area", str(MIN_MASK_REGION_AREA),  # CHANGED: Now passes 50
+            "--points_per_side", str(POINTS_PER_SIDE),
+            "--pred_iou_thresh", str(PRED_IOU_THRESH),
+            "--stability_score_thresh", str(STABILITY_SCORE_THRESH),
+            "--min_mask_region_area", str(MIN_MASK_REGION_AREA),
             "--target_class_index", str(target_class_index),
             "--class_names", json.dumps(CLASS_NAMES_MAPPING)
         ]
@@ -344,6 +347,10 @@ def merge_yolo_labels(labels_dir_class0, labels_dir_class1, output_dir):
         os.path.exists(labels_dir_class1) else set()
     all_files = files_class0.union(files_class1)
     
+    # ADD THESE DEBUG COUNTERS:
+    total_class0_instances = 0
+    total_class1_instances = 0
+    
     for filename in all_files:
         if not filename.endswith('.txt'):
             continue
@@ -354,13 +361,17 @@ def merge_yolo_labels(labels_dir_class0, labels_dir_class1, output_dir):
         path0 = os.path.join(labels_dir_class0, filename)
         if os.path.exists(path0):
             with open(path0, 'r') as f:
-                merged_lines.extend(f.readlines())
+                lines = f.readlines()
+                merged_lines.extend(lines)
+                total_class0_instances += len(lines)
         
         # Read class 1 labels
         path1 = os.path.join(labels_dir_class1, filename)
         if os.path.exists(path1):
             with open(path1, 'r') as f:
-                merged_lines.extend(f.readlines())
+                lines = f.readlines()
+                merged_lines.extend(lines)
+                total_class1_instances += len(lines)
         
         # Write merged labels
         output_path = os.path.join(output_dir, filename)
@@ -368,7 +379,11 @@ def merge_yolo_labels(labels_dir_class0, labels_dir_class1, output_dir):
             f.writelines(merged_lines)
     
     print(f"Merged {len(all_files)} label files")
+    print(f"Total class 0 instances: {total_class0_instances}")  # NEW
+    print(f"Total class 1 instances: {total_class1_instances}")  # NEW
+    print(f"Total combined instances: {total_class0_instances + total_class1_instances}")  # NEW
     print("-"*80)
+
 
 
 def check_prerequisites():
@@ -567,3 +582,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # --mode single_class --target_class 0

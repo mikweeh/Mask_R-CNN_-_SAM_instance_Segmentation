@@ -4,25 +4,29 @@
 SAM2 inference script for binary fish segmentation.
 Uses SAM2AutomaticMaskGenerator for proper mask generation.
 Outputs masks in YOLOv11 format.
-
-UPDATED: Now uses SAM2AutomaticMaskGenerator instead of exhaustive grid sampling
-for reasonable number of meaningful masks (~10-100 instead of ~4000).
 """
 
+# =============================================================================
+# IMPORTS
+# =============================================================================
+
+# Standard library imports
 import argparse
+import json
 import os
-import torch
-import torch.nn.functional as F
+
+# Third-party imports
 import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
 from PIL import Image
-import json
 
-# SAM2 imports
+# Optional dependency imports
 try:
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
-    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator  # ADD THIS
     SAM2_AVAILABLE = True
 except ImportError:
     print("WARNING: SAM2 not available. Install with:")
@@ -155,15 +159,7 @@ def update_global_variables(args):
 
 def load_sam2_mask_generator(model_id, fine_tuned_weights_path, device):
     """
-    Load SAM2AutomaticMaskGenerator for proper mask generation.
-    
-    Args:
-        model_id: Hugging Face model ID
-        fine_tuned_weights_path: Path to fine-tuned weights
-        device: Device to load model on
-    
-    Returns:
-        SAM2AutomaticMaskGenerator instance
+    Load SAM2AutomaticMaskGenerator using the correct Hugging Face approach.
     """
     if not SAM2_AVAILABLE:
         raise ImportError("SAM2 is not installed.")
@@ -171,8 +167,9 @@ def load_sam2_mask_generator(model_id, fine_tuned_weights_path, device):
     print(f"Loading SAM2 Automatic Mask Generator from: {model_id}")
     
     try:
-        # Build the model first
-        sam2_model = build_sam2(model_id, fine_tuned_weights_path, device=device)
+        # CORRECT: Use SAM2ImagePredictor first, then extract the model
+        predictor = SAM2ImagePredictor.from_pretrained(model_id)
+        sam2_model = predictor.model.to(device)
         
         # Load fine-tuned weights if available
         if os.path.exists(fine_tuned_weights_path):
@@ -201,7 +198,6 @@ def load_sam2_mask_generator(model_id, fine_tuned_weights_path, device):
     except Exception as e:
         print(f"Error loading SAM2: {e}")
         raise
-
 
 # =============================================================================
 # Mask Processing Functions - USING AUTOMATIC MASK GENERATOR

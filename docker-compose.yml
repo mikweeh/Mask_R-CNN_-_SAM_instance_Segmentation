@@ -20,7 +20,7 @@ services:
               count: all
               capabilities: [gpu]
     ports:
-      - "5678:5678"
+      - "${DEBUG_PORT:-5678}:5678"
     volumes:
       - ./:/ws
       - ${DATASET}:/ws/dataset:rw
