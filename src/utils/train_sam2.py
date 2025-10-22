@@ -109,6 +109,17 @@ DICE_WEIGHT = 2.0
 # Max number of instances per image
 MAX_INSTANCES_PER_IMAGE = 100
 
+# Option to train on all classes (unified model)
+TRAIN_UNIFIED = False  # Set via command line argument
+
+# if TRAIN_UNIFIED:
+#     # Don't filter by class - load ALL annotations
+#     print("Training UNIFIED model on all fish classes")
+#     # Use unfiltered COCO annotations
+# else:
+#     # Original per-class training
+#     print(f"Training on class: {CLASS_NAMES[TARGET_CLASS_INDEX]}")
+
 # Report configuration
 REPORT_OUTPUT_PATH = "results"
 TEMP_FIGURES_PATH = os.path.join(REPORT_OUTPUT_PATH, "imgs")
@@ -880,6 +891,9 @@ def parse_arguments():
     parser.add_argument('--max_instances_per_image', type=int,
                         default=MAX_INSTANCES_PER_IMAGE,
                         help='Maximum instances to process per image')
+    parser.add_argument('--train_unified', action='store_true',
+                        default=False,
+                        help='Train on all classes (unified model)')
     
     return parser.parse_args()
 
@@ -890,7 +904,8 @@ def update_global_variables(args):
            TRAIN_ANNOTATIONS, VAL_ANNOTATIONS, NUM_EPOCHS, BATCH_SIZE, \
            LEARNING_RATE, IMG_SIZE, REPORT_OUTPUT_PATH, TEMP_FIGURES_PATH, \
            CLASS_NAMES, TARGET_CLASS_INDEX, SAM2_MODEL_ID, \
-           GRADIENT_ACCUMULATION_STEPS, DICE_WEIGHT, MAX_INSTANCES_PER_IMAGE
+           GRADIENT_ACCUMULATION_STEPS, DICE_WEIGHT, MAX_INSTANCES_PER_IMAGE, \
+           TRAIN_UNIFIED
     
     MODEL_PATH = args.model_path
     DATASET_PATH = args.dataset_path
@@ -904,13 +919,31 @@ def update_global_variables(args):
     GRADIENT_ACCUMULATION_STEPS = args.gradient_accumulation_steps
     DICE_WEIGHT = args.dice_weight
     MAX_INSTANCES_PER_IMAGE = args.max_instances_per_image
+    TRAIN_UNIFIED = args.train_unified
     
     TRAIN_IMAGES_PATH = os.path.join(DATASET_PATH, "train")
     VAL_IMAGES_PATH = os.path.join(DATASET_PATH, "valid")
-    TRAIN_ANNOTATIONS = os.path.join(TRAIN_IMAGES_PATH,
-                                      "_annotations_filtered.coco.json")
-    VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH,
-                                    "_annotations_filtered.coco.json")
+
+    if TRAIN_UNIFIED:
+        # Use ORIGINAL annotations (all classes)
+        TRAIN_ANNOTATIONS = os.path.join(
+            DATASET_PATH, "original_coco/train/_annotations.coco.json"
+        )
+        VAL_ANNOTATIONS = os.path.join(
+            DATASET_PATH, "original_coco/valid/_annotations.coco.json"
+        )
+        print("UNIFIED MODE: Using original annotations with ALL classes")
+    else:
+        # Use filtered annotations (single class)
+        TRAIN_ANNOTATIONS = os.path.join(
+            TRAIN_IMAGES_PATH, "_annotations_filtered.coco.json"
+        )
+        VAL_ANNOTATIONS = os.path.join(
+            VAL_IMAGES_PATH, "_annotations_filtered.coco.json"
+        )
+        print(f"SINGLE CLASS MODE: Using filtered annotations for "
+              f"class {TARGET_CLASS_INDEX}")
+
     TEMP_FIGURES_PATH = os.path.join(REPORT_OUTPUT_PATH, "imgs")
     
     if args.class_names is not None:
@@ -932,7 +965,14 @@ def main():
     print("SAM2 TRAINING CONFIGURATION - IMPROVED FOR SMALL OBJECTS")
     print("="*60)
     print(f"Using device: {DEVICE}")
-    print(f"Target class: {CLASS_NAMES.get(TARGET_CLASS_INDEX, 'unknown')}")
+
+    if TRAIN_UNIFIED:
+        print("Training mode: UNIFIED (all classes)")
+        print(f"Training on all fish species: {list(CLASS_NAMES.values())}")
+    else:
+        print(f"Training mode: SINGLE CLASS")
+        print(f"Target class: {CLASS_NAMES.get(TARGET_CLASS_INDEX, 'unknown')}")
+
     print(f"SAM2 Model ID: {SAM2_MODEL_ID}")
     print(f"Number of epochs: {NUM_EPOCHS} (INCREASED)")
     print(f"Learning rate: {LEARNING_RATE} (LOWERED)")

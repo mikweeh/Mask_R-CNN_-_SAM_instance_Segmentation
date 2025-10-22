@@ -52,6 +52,19 @@ BASE_MODEL_NAMES = {
     1: "sam2_coris"     # Coris julis
 }
 
+# =============================================================================
+# NEW: HYBRID PIPELINE CONFIGURATION
+# =============================================================================
+
+# Master switch: Enable hybrid mode (Mask R-CNN + SAM2)
+USE_HYBRID_MODE = True  # Set to True to enable hybrid pipeline
+
+# Mask R-CNN model path (your existing trained model)
+MASKRCNN_MODEL_PATH = "weights/m09_1.pth"
+
+# Unified SAM2 model name (trained on both classes)
+UNIFIED_SAM2_MODEL = "sam2_fish_unified.pth"
+
 # Training parameters (simpler than Mask R-CNN)
 NUM_CLASSES = 1  # Binary segmentation per model
 BATCH_SIZE = 1
@@ -492,21 +505,118 @@ def run_single_class_pipeline(target_class_index, mode='full'):
     
     return temp_labels_dir, temp_images_dir
 
+def run_hybrid_inference():
+    """
+    Run hybrid Mask R-CNN + SAM2 inference.
+    Combines class predictions from Mask R-CNN with refined masks from SAM2.
+    """
+    print_step_header("HYBRID", "MASK R-CNN + SAM2 INFERENCE")
+    
+    print(f"Mask R-CNN model: {MASKRCNN_MODEL_PATH}")
+    print(f"SAM2 model: {UNIFIED_SAM2_MODEL}")
+    
+    try:
+        cmd = [
+            sys.executable, "src/utils/infer_hybrid.py",
+            "--maskrcnn_model", MASKRCNN_MODEL_PATH,
+            "--sam2_model", os.path.join("weights", UNIFIED_SAM2_MODEL),
+            "--sam2_model_id", SAM2_MODEL_ID,
+            "--input_folder", os.path.join(DATASET_PATH, "test"),
+            "--output_labels", os.path.join(DATASET_PATH, "inference",
+                                             "labels_hybrid"),
+            "--output_images", os.path.join(DATASET_PATH, "inference",
+                                             "images_hybrid"),
+            "--detection_threshold", "0.5"
+        ]
+        
+        print(f"Running hybrid inference with {len(cmd)} parameters...")
+        result = subprocess.run(cmd, check=True)
+        print_step_footer("Hybrid Inference")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Hybrid inference failed with return code "
+              f"{e.returncode}")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("ERROR: src/utils/infer_hybrid.py not found")
+        sys.exit(1)
+
+
+def train_unified_sam2():
+    """
+    Train a single unified SAM2 model on ALL fish classes.
+    This model will be used in hybrid pipeline.
+    """
+    print_step_header("UNIFIED", "TRAINING UNIFIED SAM2 MODEL")
+    print("Training on ALL classes for hybrid pipeline")
+    
+    model_path = os.path.join("weights", UNIFIED_SAM2_MODEL)
+    
+    try:
+        cmd = [
+            sys.executable, "src/utils/train_sam2.py",
+            "--dataset_path", DATASET_PATH,
+            "--model_path", model_path,
+            "--sam2_model_id", SAM2_MODEL_ID,
+            "--num_epochs", str(NUM_EPOCHS),
+            "--batch_size", str(BATCH_SIZE),
+            "--learning_rate", str(LEARNING_RATE),
+            "--img_size", str(IMG_SIZE),
+            "--report_output_path", REPORT_OUTPUT_PATH,
+            "--class_names", json.dumps(CLASS_NAMES_MAPPING),
+            "--target_class_index", "0",  # Doesn't matter for unified
+            "--gradient_accumulation_steps",
+                str(GRADIENT_ACCUMULATION_STEPS),
+            "--dice_weight", str(DICE_WEIGHT),
+            "--max_instances_per_image", str(MAX_INSTANCES_PER_IMAGE),
+            "--train_unified"  # NEW: Enable unified training
+        ]
+        
+        print(f"Running unified SAM2 training with {len(cmd)} parameters...")
+        result = subprocess.run(cmd, check=True)
+        print_step_footer("Unified SAM2 Training")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Unified training failed with return code "
+              f"{e.returncode}")
+        sys.exit(1)
+
 
 def main():
     """Main pipeline execution function."""
     pipeline_start_time = datetime.now()
     
-    print("\n" + "="*80)
+    print("="*80)
     print("SAM2 FISH SEGMENTATION COMPLETE PIPELINE")
     print("="*80)
     print(f"Started at: {pipeline_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Execution mode: {args.mode}")
     
+    # Check if hybrid mode is enabled
+    if USE_HYBRID_MODE:
+        print("Pipeline mode: HYBRID (Mask R-CNN + SAM2)")
+    else:
+        print("Pipeline mode: STANDARD (SAM2 only)")
+    
     check_prerequisites()
     
     try:
-        if args.mode == 'single_class':
+        # Hybrid mode pipeline
+        if USE_HYBRID_MODE and args.mode == 'full':
+            print("\nRunning HYBRID pipeline...")
+            
+            # Step 1: Train unified SAM2 model
+            # train_unified_sam2()
+            
+            # Step 2: Run hybrid inference
+            run_hybrid_inference()
+            
+            print("\n" + "="*80)
+            print("!!! HYBRID PIPELINE FINISHED SUCCESSFULLY !!!")
+            print("="*80)
+            
+        # Standard per-class pipeline
+        elif args.mode == 'singleclass':
             # Single class mode
             if args.target_class is None:
                 print("ERROR: --target_class required for single_class mode")
@@ -558,23 +668,12 @@ def main():
             
             # Run adapt2rbf to combine with original labels
             run_adapt2rbf()
-        
-        pipeline_end_time = datetime.now()
-        duration = pipeline_end_time - pipeline_start_time
-        
-        print("\n" + "="*80)
-        print("!!! PIPELINE FINISHED SUCCESSFULLY !!!")
-        print("="*80)
-        print(f"Total duration: {str(duration).split('.')[0]}")
-        print(f"Combined labels: {OUTPUT_LABELS_FOLDER}")
-        print(f"Upload folder: {UPLOAD_FOLDER}")
-        print("="*80)
-
+            
     except KeyboardInterrupt:
-        print("\n\nPipeline interrupted by user (Ctrl+C)")
+        print("\nPipeline interrupted by user (Ctrl+C)")
         sys.exit(1)
     except Exception as e:
-        print(f"\n\nUnexpected error in pipeline: {e}")
+        print(f"\nUnexpected error in pipeline: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
