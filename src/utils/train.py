@@ -1707,17 +1707,6 @@ def main():
                         betas=(0.9, 0.999),
                         eps=1e-8)
 
-
-    # # Learning rate scheduler
-    # scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
-    #                                           milestones=[100, 150],
-    #                                           gamma=0.1)
-
-    # # Warmup scheduler for first few epochs
-    # warmup_scheduler = optim.lr_scheduler.LinearLR(optimizer,
-    #                                               start_factor=0.1,
-    #                                               total_iters=10)
-
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',

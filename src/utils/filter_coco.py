@@ -314,7 +314,7 @@ def main() -> None:
     parser.add_argument('--classes_to_keep', type=str, default=None,
                         help='JSON string with list of class names')
     
-    # NEW: Add target_class_index argument for single-class filtering
+    # Add target_class_index argument for single-class filtering
     parser.add_argument('--target_class_index', type=int, default=0,
                         help='Index of target class to filter (0 or 1)')
     
