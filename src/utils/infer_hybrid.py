@@ -240,7 +240,8 @@ def load_sam2_predictor(model_id, fine_tuned_weights_path, device):
 # HYBRID INFERENCE
 # =============================================================================
 
-def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5):
+def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5,
+                          img_size=2048):
     """
     Run Mask R-CNN inference to get detections.
     
@@ -248,13 +249,44 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5):
         model: Mask R-CNN model
         image_rgb: Image as numpy array (H, W, 3) in RGB
         confidence_threshold: Minimum confidence score
+        img_size: Image size used during training (default: 2048)
     
     Returns:
-        List of detections: [{'box': [x1,y1,x2,y2], 'class': int,
-                              'score': float}, ...]
+        List of detections with boxes scaled back to original size
     """
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    
+    # Store original dimensions
+    original_height, original_width = image_rgb.shape[:2]
+    
+    # Apply the SAME transformations as during training
+    transform = A.Compose([
+        A.LongestMaxSize(max_size=img_size, p=1.0),
+        A.PadIfNeeded(
+            min_height=img_size,
+            min_width=img_size,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            p=1.0
+        ),
+    ])
+    
+    # Transform image
+    transformed = transform(image=image_rgb)
+    image_transformed = transformed['image']
+    
+    # Calculate transformation parameters for reverse mapping
+    scale_factor = img_size / max(original_height, original_width)
+    scaled_height = int(original_height * scale_factor)
+    scaled_width = int(original_width * scale_factor)
+    pad_top = (img_size - scaled_height) // 2
+    pad_left = (img_size - scaled_width) // 2
+    
     # Convert to tensor
-    image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float()
+    image_tensor = torch.from_numpy(image_transformed).permute(
+        2, 0, 1
+    ).float()
     image_tensor = image_tensor / 255.0
     image_tensor = image_tensor.to(DEVICE)
     
@@ -262,7 +294,7 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5):
     with torch.no_grad():
         predictions = model([image_tensor])[0]
     
-    # Extract detections above threshold
+    # Extract detections and map boxes back to original coordinates
     detections = []
     boxes = predictions['boxes'].cpu().numpy()
     labels = predictions['labels'].cpu().numpy()
@@ -270,16 +302,37 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5):
     
     for box, label, score in zip(boxes, labels, scores):
         if score >= confidence_threshold:
+            # Reverse the transformation on bounding box
+            # 1. Remove padding
+            x1, y1, x2, y2 = box
+            x1 = x1 - pad_left
+            y1 = y1 - pad_top
+            x2 = x2 - pad_left
+            y2 = y2 - pad_top
+            
+            # 2. Reverse scaling
+            x1 = x1 / scale_factor
+            y1 = y1 / scale_factor
+            x2 = x2 / scale_factor
+            y2 = y2 / scale_factor
+            
+            # 3. Clip to original image bounds
+            x1 = max(0, min(x1, original_width))
+            y1 = max(0, min(y1, original_height))
+            x2 = max(0, min(x2, original_width))
+            y2 = max(0, min(y2, original_height))
+            
             # Convert to class index (Mask R-CNN uses 1-indexed)
             class_idx = int(label) - 1
             
             detections.append({
-                'box': box.astype(int),  # [x1, y1, x2, y2]
-                'class': class_idx,  # 0 or 1
+                'box': np.array([x1, y1, x2, y2], dtype=int),
+                'class': class_idx,
                 'score': float(score)
             })
     
     return detections
+
 
 
 def refine_mask_with_sam2(predictor, image_rgb, bbox):
@@ -350,7 +403,8 @@ def mask_to_yolo_polygon(mask, class_id):
     return f'{class_id} {coords_str}'
 
 
-def process_image_hybrid(maskrcnn_model, sam2_predictor, image_path):
+def process_image_hybrid(maskrcnn_model, sam2_predictor, image_path,
+                        maskrcnn_img_size=2048):
     """
     Process a single image with the hybrid pipeline.
     
@@ -358,6 +412,7 @@ def process_image_hybrid(maskrcnn_model, sam2_predictor, image_path):
         maskrcnn_model: Mask R-CNN model
         sam2_predictor: SAM2 predictor
         image_path: Path to image file
+        maskrcnn_img_size: IMG_SIZE used during Mask R-CNN training
     
     Returns:
         List of YOLO format annotation strings
@@ -366,9 +421,13 @@ def process_image_hybrid(maskrcnn_model, sam2_predictor, image_path):
     image = cv2.imread(image_path)
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     
-    # Step 1: Get detections from Mask R-CNN
-    detections = run_maskrcnn_inference(maskrcnn_model, image_rgb,
-                                         DETECTION_THRESHOLD)
+    # Step 1: Get detections from Mask R-CNN (with proper img_size)
+    detections = run_maskrcnn_inference(
+        maskrcnn_model,
+        image_rgb,
+        DETECTION_THRESHOLD,
+        img_size=maskrcnn_img_size
+    )
     
     if len(detections) == 0:
         return []
@@ -460,6 +519,8 @@ def main():
                         default=OUTPUT_IMAGES_FOLDER)
     parser.add_argument('--detection_threshold', type=float,
                         default=DETECTION_THRESHOLD)
+    parser.add_argument('--maskrcnn_img_size', type=int, default=2048,
+                   help='IMG_SIZE used during Mask R-CNN training')
     
     args = parser.parse_args()
     
@@ -499,8 +560,10 @@ def main():
         try:
             # Run hybrid inference
             yolo_annotations = process_image_hybrid(maskrcnn_model,
-                                                     sam2_predictor,
-                                                     img_path)
+                sam2_predictor,
+                img_path,
+                maskrcnn_img_size=args.maskrcnn_img_size
+                )
             
             print(f"  Detected {len(yolo_annotations)} fish\n")
             

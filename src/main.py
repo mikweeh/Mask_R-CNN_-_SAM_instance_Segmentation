@@ -40,7 +40,8 @@ UNIFIED_SAM2_MODEL = "weights/sam2_fish_unified.pth"
 NUM_EPOCHS = 300
 BATCH_SIZE = 1
 LEARNING_RATE = 5e-6
-IMG_SIZE = 1024
+MASKRCNN_IMG_SIZE = 2048  # IMG_SIZE used for Mask R-CNN training/inference
+SAM2_IMG_SIZE = 1024      # IMG_SIZE used for SAM2 training
 GRADIENT_ACCUMULATION_STEPS = 2
 DICE_WEIGHT = 2.0
 MAX_INSTANCES_PER_IMAGE = 15
@@ -141,6 +142,7 @@ def train_maskrcnn():
     print_header("STEP 1: TRAINING MASK R-CNN")
     print(f"Model: {MASKRCNN_MODEL_PATH}")
     print(f"Epochs: {NUM_EPOCHS}")
+    print(f"IMG_SIZE: {MASKRCNN_IMG_SIZE}")  # ADD THIS LINE
     print(f"Classes: {CLASSES_TO_KEEP}")
     
     try:
@@ -150,7 +152,8 @@ def train_maskrcnn():
             "--model_path", MASKRCNN_MODEL_PATH,
             "--num_epochs", str(NUM_EPOCHS),
             "--batch_size", str(BATCH_SIZE),
-            "--learning_rate", str(LEARNING_RATE)
+            "--learning_rate", str(LEARNING_RATE),
+            "--img_size", str(MASKRCNN_IMG_SIZE)  # ADD THIS LINE
         ]
         
         print(f"\nRunning Mask R-CNN training...")
@@ -175,6 +178,7 @@ def train_sam2():
     print(f"Model: {UNIFIED_SAM2_MODEL}")
     print(f"Training on ALL classes: {CLASSES_TO_KEEP}")
     print(f"Epochs: {NUM_EPOCHS}")
+    print(f"IMG_SIZE: {SAM2_IMG_SIZE}")  # ADD THIS LINE
     
     try:
         cmd = [
@@ -185,12 +189,12 @@ def train_sam2():
             "--num_epochs", str(NUM_EPOCHS),
             "--batch_size", str(BATCH_SIZE),
             "--learning_rate", str(LEARNING_RATE),
-            "--img_size", str(IMG_SIZE),
+            "--img_size", str(SAM2_IMG_SIZE),  # MODIFY THIS LINE
             "--report_output_path", REPORT_OUTPUT_PATH,
             "--class_names", json.dumps(CLASS_NAMES_MAPPING),
             "--target_class_index", "0",
             "--gradient_accumulation_steps",
-                str(GRADIENT_ACCUMULATION_STEPS),
+            str(GRADIENT_ACCUMULATION_STEPS),
             "--dice_weight", str(DICE_WEIGHT),
             "--max_instances_per_image", str(MAX_INSTANCES_PER_IMAGE),
             "--train_unified"
@@ -212,7 +216,7 @@ def train_sam2():
 def run_inference():
     """Run hybrid Mask R-CNN + SAM2 inference."""
     print_header("STEP 3: HYBRID INFERENCE (Mask R-CNN + SAM2)")
-    print(f"Mask R-CNN: {MASKRCNN_MODEL_PATH}")
+    print(f"Mask R-CNN: {MASKRCNN_MODEL_PATH} (IMG_SIZE={MASKRCNN_IMG_SIZE})")
     print(f"SAM2: {UNIFIED_SAM2_MODEL}")
     print(f"Output: {OUTPUT_LABELS_FOLDER}")
     
@@ -230,7 +234,8 @@ def run_inference():
             "--input_folder", os.path.join(DATASET_PATH, "test"),
             "--output_labels", OUTPUT_LABELS_FOLDER,
             "--output_images", OUTPUT_IMAGES_FOLDER,
-            "--detection_threshold", "0.5"
+            "--detection_threshold", "0.5",
+            "--maskrcnn_img_size", str(MASKRCNN_IMG_SIZE)  # ADD THIS LINE
         ]
         
         print(f"\nRunning hybrid inference...")
@@ -240,7 +245,6 @@ def run_inference():
     except subprocess.CalledProcessError as e:
         print(f"✗ ERROR: Inference failed (code {e.returncode})")
         sys.exit(1)
-
 
 # =============================================================================
 # STEP 4: CREATE UPLOAD FOLDER (adapt2rbf.py)
