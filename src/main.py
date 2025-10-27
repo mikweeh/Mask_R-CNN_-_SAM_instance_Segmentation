@@ -40,14 +40,14 @@ TARGET_CLASSES_FOR_REPLACEMENT = [0, 1]
 # =============================================================================
 
 # Base model name - will be updated to ensure uniqueness
-BASE_MODEL_NAME = "m04"
+BASE_MODEL_NAME = "mask_rcnn_fish_model_1024"
 NUM_CLASSES = len(CLASSES_TO_KEEP) + 1 # +1 for background class
 
 # Training parameters
 BATCH_SIZE = 1
 NUM_EPOCHS = 200
 LEARNING_RATE = 0.0001
-IMG_SIZE = 2048
+IMG_SIZE = 1024
 CONFIDENCE_THRESHOLD = 0.3
 DICE_WEIGHT = 0.0
 MASK_RESOLUTION = 112

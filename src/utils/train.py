@@ -1272,9 +1272,9 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
     
     # Define colors for different classes (BGR format for OpenCV)
     class_colors = {
-        0: (0, 255, 0),    # Green for Chromis
-        1: (255, 0, 0),    # Blue for Coris
-        2: (0, 0, 255),    # Red for additional class if needed
+        0: (0, 255, 0),  # Green for Chromis
+        1: (255, 0, 0),  # Blue for Coris
+        2: (0, 0, 255),  # Red for additional class if needed
     }
     
     masks = predictions['masks']
@@ -1300,16 +1300,17 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
             if mask_data.ndim == 3:
                 mask = mask_data[0]  # Take the first channel if 3D
             elif mask_data.ndim == 2:
-                mask = mask_data     # Use directly if 2D
+                mask = mask_data  # Use directly if 2D
             else:
-                print(f"Mask {i} has unexpected dimensions: {mask_data.ndim}, skipping")
+                print(f"Mask {i} has unexpected dimensions: "
+                      f"{mask_data.ndim}, skipping")
                 continue
             
             # Check if mask has valid data
             if mask is None:
                 print(f"Mask data {i} is None after extraction, skipping")
                 continue
-                
+            
             label = labels[i]
             
             # Map class if necessary
@@ -1318,7 +1319,23 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
             else:
                 print(f"Label {label} not in class mapping, skipping")
                 continue
-                
+            
+            # Ensure mask is at IMG_SIZE before reversing transformation
+            if isinstance(mask, np.ndarray):
+                mask_tensor = torch.from_numpy(mask)
+            else:
+                mask_tensor = mask
+            
+            # Resize mask to IMG_SIZE if it's not already
+            if mask_tensor.shape[0] != IMG_SIZE or mask_tensor.shape[1] != IMG_SIZE:
+                mask_resized = F.interpolate(
+                    mask_tensor.unsqueeze(0).unsqueeze(0),
+                    size=(IMG_SIZE, IMG_SIZE),
+                    mode='bilinear',
+                    align_corners=False
+                )[0, 0]
+                mask = mask_resized.numpy() if torch.is_tensor(mask_resized) else mask_resized
+            
             # Properly reverse the transformation
             mask_original = reverse_mask_transformation(mask, transform_params)
             
@@ -1352,17 +1369,17 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
             
             # Ensure we have valid arrays for cv2.addWeighted
             try:
-                if result_image[mask_area].size > 0 and colored_mask[mask_area].size > 0:
+                if (result_image[mask_area].size > 0 and 
+                    colored_mask[mask_area].size > 0):
                     result_image[mask_area] = cv2.addWeighted(
-                        result_image[mask_area], 
-                        1.0 - alpha, 
-                        colored_mask[mask_area], 
-                        alpha, 
+                        result_image[mask_area],
+                        1.0 - alpha,
+                        colored_mask[mask_area],
+                        alpha,
                         0
                     )
                 else:
                     print(f"Empty mask regions for mask {i}, skipping overlay")
-                    
             except Exception as e:
                 print(f"Error applying overlay for mask {i}: {e}")
                 continue
@@ -1372,6 +1389,7 @@ def create_mask_overlay(image, predictions, original_size, alpha: float = 0.6):
             continue
     
     return result_image
+
 
 def save_inference_examples(model, output_path):
     """
