@@ -243,24 +243,23 @@ def load_sam2_predictor(model_id, fine_tuned_weights_path, device):
 def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5,
                           img_size=2048):
     """
-    Run Mask R-CNN inference to get detections.
+    Run Mask R-CNN inference with proper image transformation.
     
     Args:
         model: Mask R-CNN model
         image_rgb: Image as numpy array (H, W, 3) in RGB
         confidence_threshold: Minimum confidence score
-        img_size: Image size used during training (default: 2048)
+        img_size: Image size used during training
     
     Returns:
-        List of detections with boxes scaled back to original size
+        List of detections with boxes in original image coordinates
     """
     import albumentations as A
-    from albumentations.pytorch import ToTensorV2
     
     # Store original dimensions
     original_height, original_width = image_rgb.shape[:2]
     
-    # Apply the SAME transformations as during training
+    # Apply transformations (same as training)
     transform = A.Compose([
         A.LongestMaxSize(max_size=img_size, p=1.0),
         A.PadIfNeeded(
@@ -272,11 +271,10 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5,
         ),
     ])
     
-    # Transform image
     transformed = transform(image=image_rgb)
     image_transformed = transformed['image']
     
-    # Calculate transformation parameters for reverse mapping
+    # Calculate transformation parameters
     scale_factor = img_size / max(original_height, original_width)
     scaled_height = int(original_height * scale_factor)
     scaled_width = int(original_width * scale_factor)
@@ -294,7 +292,7 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5,
     with torch.no_grad():
         predictions = model([image_tensor])[0]
     
-    # Extract detections and map boxes back to original coordinates
+    # Extract detections and reverse transformation
     detections = []
     boxes = predictions['boxes'].cpu().numpy()
     labels = predictions['labels'].cpu().numpy()
@@ -302,27 +300,20 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5,
     
     for box, label, score in zip(boxes, labels, scores):
         if score >= confidence_threshold:
-            # Reverse the transformation on bounding box
-            # 1. Remove padding
+            # Reverse transformation
             x1, y1, x2, y2 = box
-            x1 = x1 - pad_left
-            y1 = y1 - pad_top
-            x2 = x2 - pad_left
-            y2 = y2 - pad_top
+            x1 = (x1 - pad_left) / scale_factor
+            y1 = (y1 - pad_top) / scale_factor
+            x2 = (x2 - pad_left) / scale_factor
+            y2 = (y2 - pad_top) / scale_factor
             
-            # 2. Reverse scaling
-            x1 = x1 / scale_factor
-            y1 = y1 / scale_factor
-            x2 = x2 / scale_factor
-            y2 = y2 / scale_factor
-            
-            # 3. Clip to original image bounds
+            # Clip to image bounds
             x1 = max(0, min(x1, original_width))
             y1 = max(0, min(y1, original_height))
             x2 = max(0, min(x2, original_width))
             y2 = max(0, min(y2, original_height))
             
-            # Convert to class index (Mask R-CNN uses 1-indexed)
+            # Mask R-CNN uses 1-indexed labels
             class_idx = int(label) - 1
             
             detections.append({
@@ -333,6 +324,165 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5,
     
     return detections
 
+
+def process_all_images_hybrid(maskrcnn_model, sam2_predictors,
+                              class_names, input_folder, output_labels,
+                              output_images, maskrcnn_img_size=2048):
+    """
+    Process all images with sequential class-specific SAM2 refinement.
+    
+    Args:
+        maskrcnn_model: Mask R-CNN model
+        sam2_predictors: Dict {class_idx: SAM2ImagePredictor}
+        class_names: Dict {class_idx: class_name}
+        input_folder: Folder with test images
+        output_labels: Output folder for YOLO labels
+        output_images: Output folder for images (not used)
+        maskrcnn_img_size: IMG_SIZE used during Mask R-CNN training
+    """
+    # Create output folders
+    os.makedirs(output_labels, exist_ok=True)
+    os.makedirs(output_images, exist_ok=True)
+    
+    # Get all images
+    image_files = [
+        f for f in os.listdir(input_folder)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ]
+    
+    if not image_files:
+        print(f"No images found in {input_folder}")
+        return
+    
+    print(f"\nFound {len(image_files)} images to process")
+
+    # PHASE 1: Mask R-CNN detection
+    # =============================
+    print("\n" + "="*80)
+    print("PHASE 1: Mask R-CNN Detection")
+    print("="*80)
+    
+    all_detections = {}
+    
+    for idx, img_file in enumerate(image_files, 1):
+        img_path = os.path.join(input_folder, img_file)
+        print(f"[{idx}/{len(image_files)}] Detecting: {img_file}")
+        
+        image = cv2.imread(img_path)
+        if image is None:
+            print(f"  ✗ Failed to load, skipping")
+            continue
+        
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        detections = run_maskrcnn_inference(
+            maskrcnn_model,
+            image_rgb,
+            DETECTION_THRESHOLD,
+            img_size=maskrcnn_img_size
+        )
+        
+        all_detections[img_path] = {
+            'detections': detections,
+            'image_rgb': image_rgb,
+            'img_file': img_file
+        }
+        
+        # Print detection summary
+        class_counts = {cls_idx: 0 for cls_idx in class_names.keys()}
+        for d in detections:
+            class_counts[d['class']] += 1
+        
+        summary = ", ".join(
+            f"{class_counts[cls_idx]} {class_names[cls_idx]}"
+            for cls_idx in sorted(class_names.keys())
+        )
+        print(f"  Detected: {summary}")
+    
+    # PHASE 2+: Sequential SAM2 processing per class
+    # ==============================================
+    annotations_by_image = {img_path: [] for img_path in all_detections}
+    
+    for class_idx in sorted(sam2_predictors.keys()):
+        class_name = class_names[class_idx]
+        predictor = sam2_predictors[class_idx]
+        
+        print("\n" + "="*80)
+        print(f"PHASE {class_idx + 2}: SAM2 Refinement for {class_name}")
+        print("="*80)
+        
+        # Count total instances for this class
+        total_instances = sum(
+            sum(1 for d in data['detections'] if d['class'] == class_idx)
+            for data in all_detections.values()
+        )
+        print(f"Processing {total_instances} {class_name} instances")
+        
+        processed = 0
+        for img_path, data in all_detections.items():
+            img_file = data['img_file']
+            image_rgb = data['image_rgb']
+            class_dets = [
+                d for d in data['detections'] if d['class'] == class_idx
+            ]
+            
+            if not class_dets:
+                continue
+            
+            print(f"\nProcessing {img_file}: {len(class_dets)} {class_name}")
+            
+            for det in class_dets:
+                processed += 1
+                print(f"  [{processed}/{total_instances}] "
+                      f"{class_name} (score: {det['score']:.3f})")
+                
+                # Refine with class-specific SAM2
+                refined_mask = refine_mask_with_sam2(
+                    predictor,
+                    image_rgb,
+                    det['box']
+                )
+                
+                if refined_mask is not None:
+                    yolo_str = mask_to_yolo_segmentation(
+                        refined_mask,
+                        det['class'],
+                        image_rgb.shape[:2]
+                    )
+                    if yolo_str:
+                        annotations_by_image[img_path].append(yolo_str)
+        
+        # Free GPU memory after each class
+        print(f"\n  Unloading SAM2 model for {class_name}...")
+        del predictor
+        torch.cuda.empty_cache()
+    
+    # PHASE FINAL: Save annotations
+    # =============================
+    print("\n" + "="*80)
+    print("FINAL PHASE: Saving Annotations")
+    print("="*80)
+    
+    for img_path, yolo_annotations in annotations_by_image.items():
+        img_file = all_detections[img_path]['img_file']
+        base_name = os.path.splitext(img_file)[0]
+        label_path = os.path.join(output_labels, f"{base_name}.txt")
+        
+        with open(label_path, 'w') as f:
+            f.write('\n'.join(yolo_annotations))
+        
+        print(f"  Saved: {base_name}.txt ({len(yolo_annotations)} masks)")
+    
+    # Summary
+    total_masks = sum(len(anns) for anns in annotations_by_image.values())
+    print(f"\n✓ Processed {len(image_files)} images")
+    print(f"  Total masks: {total_masks}")
+    for class_idx, class_name in sorted(class_names.items()):
+        class_total = sum(
+            sum(1 for d in data['detections'] if d['class'] == class_idx)
+            for data in all_detections.values()
+        )
+        print(f"  - {class_name}: {class_total} instances")
 
 
 def refine_mask_with_sam2(predictor, image_rgb, bbox):
@@ -501,92 +651,97 @@ def create_visualization(image_path, yolo_annotations, output_path):
 # =============================================================================
 
 def main():
-    """Main function for hybrid inference."""
+    """Main inference function."""
     parser = argparse.ArgumentParser(
-        description='Hybrid Mask R-CNN + SAM2 inference'
+        description='Hybrid inference with Mask R-CNN + Multi-SAM2'
     )
-    parser.add_argument('--maskrcnn_model', type=str,
-                        default=MASKRCNN_MODEL_PATH)
-    parser.add_argument('--sam2_model', type=str,
-                        default=SAM2_MODEL_PATH)
+    parser.add_argument('--maskrcnn_model', type=str, required=True,
+                       help='Path to Mask R-CNN model')
+    parser.add_argument('--sam2_model_paths', type=str, required=True,
+                       help='JSON dict of {class_idx: model_path}')
     parser.add_argument('--sam2_model_id', type=str,
-                        default=SAM2_MODEL_ID)
-    parser.add_argument('--input_folder', type=str,
-                        default=INPUT_IMAGES_FOLDER)
-    parser.add_argument('--output_labels', type=str,
-                        default=OUTPUT_LABELS_FOLDER)
-    parser.add_argument('--output_images', type=str,
-                        default=OUTPUT_IMAGES_FOLDER)
-    parser.add_argument('--detection_threshold', type=float,
-                        default=DETECTION_THRESHOLD)
+                       default='facebook/sam2.1-hiera-large',
+                       help='SAM2 model ID')
+    parser.add_argument('--input_folder', type=str, required=True,
+                       help='Input folder with images')
+    parser.add_argument('--output_labels', type=str, required=True,
+                       help='Output folder for labels')
+    parser.add_argument('--output_images', type=str, required=True,
+                       help='Output folder for images')
+    parser.add_argument('--detection_threshold', type=float, default=0.5,
+                       help='Detection confidence threshold')
     parser.add_argument('--maskrcnn_img_size', type=int, default=2048,
-                   help='IMG_SIZE used during Mask R-CNN training')
+                       help='IMG_SIZE used during Mask R-CNN training')
+    parser.add_argument('--class_names', type=str, required=True,
+                       help='JSON dict of {class_idx: class_name}')
     
     args = parser.parse_args()
     
-    print("\n" + "="*60)
-    print("HYBRID INFERENCE: Mask R-CNN + SAM2")
-    print("="*60)
-    print(f"Device: {DEVICE}")
+    # Parse JSON arguments
+    sam2_model_paths = json.loads(args.sam2_model_paths)
+    # Convert string keys to int
+    sam2_model_paths = {int(k): v for k, v in sam2_model_paths.items()}
+    
+    class_names = json.loads(args.class_names)
+    class_names = {int(k): v for k, v in class_names.items()}
+    
+    # Set global threshold
+    global DETECTION_THRESHOLD
+    DETECTION_THRESHOLD = args.detection_threshold
+    
+    print("="*80)
+    print("HYBRID INFERENCE: Mask R-CNN + Multi-SAM2")
+    print("="*80)
     print(f"Mask R-CNN model: {args.maskrcnn_model}")
-    print(f"SAM2 model: {args.sam2_model}")
+    print(f"Mask R-CNN IMG_SIZE: {args.maskrcnn_img_size}")
+    print(f"SAM2 models:")
+    for class_idx in sorted(sam2_model_paths.keys()):
+        print(f"  Class {class_idx} ({class_names[class_idx]}): "
+              f"{sam2_model_paths[class_idx]}")
     print(f"Detection threshold: {args.detection_threshold}")
-    print("="*60 + "\n")
+    print(f"Input folder: {args.input_folder}")
+    print(f"Output labels: {args.output_labels}")
+    print("="*80)
     
-    # Create output folders
-    os.makedirs(args.output_labels, exist_ok=True)
-    os.makedirs(args.output_images, exist_ok=True)
+    # Check SAM2 availability
+    if not SAM2_AVAILABLE:
+        print("ERROR: SAM2 not available. Install with:")
+        print("  pip install git+https://github.com/facebookresearch/sam2.git")
+        sys.exit(1)
     
-    # Load models
-    print("Loading models...")
-    maskrcnn_model = load_maskrcnn_model(args.maskrcnn_model,
-                                          num_classes=2, device=DEVICE)
-    sam2_predictor = load_sam2_predictor(args.sam2_model_id,
-                                          args.sam2_model, DEVICE)
-    print("Models loaded successfully\n")
+    # Load Mask R-CNN model
+    print("\nLoading Mask R-CNN model...")
+    num_classes = len(class_names) + 1  # +1 for background
+    maskrcnn_model = load_maskrcnn_model(args.maskrcnn_model, num_classes)
+    print("✓ Mask R-CNN model loaded")
+    
+    # Load all SAM2 predictors
+    print("\nLoading SAM2 predictors...")
+    sam2_predictors = {}
+    for class_idx in sorted(sam2_model_paths.keys()):
+        class_name = class_names[class_idx]
+        model_path = sam2_model_paths[class_idx]
+        print(f"  Loading SAM2 for {class_name}...")
+        sam2_predictors[class_idx] = load_sam2_predictor(
+            model_path,
+            args.sam2_model_id
+        )
+        print(f"  ✓ SAM2 for {class_name} loaded")
     
     # Process all images
-    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
-    image_files = [f for f in os.listdir(args.input_folder)
-                   if any(f.lower().endswith(ext)
-                          for ext in image_extensions)]
+    process_all_images_hybrid(
+        maskrcnn_model,
+        sam2_predictors,
+        class_names,
+        args.input_folder,
+        args.output_labels,
+        args.output_images,
+        maskrcnn_img_size=args.maskrcnn_img_size
+    )
     
-    print(f"Processing {len(image_files)} images...\n")
-    
-    for img_file in image_files:
-        img_path = os.path.join(args.input_folder, img_file)
-        print(f"Processing: {img_file}")
-        
-        try:
-            # Run hybrid inference
-            yolo_annotations = process_image_hybrid(maskrcnn_model,
-                sam2_predictor,
-                img_path,
-                maskrcnn_img_size=args.maskrcnn_img_size
-                )
-            
-            print(f"  Detected {len(yolo_annotations)} fish\n")
-            
-            # Save labels
-            label_file = os.path.splitext(img_file)[0] + '.txt'
-            label_path = os.path.join(args.output_labels, label_file)
-            
-            with open(label_path, 'w') as f:
-                f.write('\n'.join(yolo_annotations))
-            
-            # Save visualization
-            vis_path = os.path.join(args.output_images, img_file)
-            create_visualization(img_path, yolo_annotations, vis_path)
-            
-        except Exception as e:
-            print(f"  Error: {e}\n")
-            continue
-    
-    print("="*60)
-    print("HYBRID INFERENCE COMPLETE!")
-    print(f"Labels saved in: {args.output_labels}")
-    print(f"Visualizations saved in: {args.output_images}")
-    print("="*60)
+    print("\n" + "="*80)
+    print("INFERENCE COMPLETED ✓")
+    print("="*80)
 
 
 if __name__ == "__main__":
