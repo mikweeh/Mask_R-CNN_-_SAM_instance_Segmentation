@@ -76,24 +76,27 @@ TARGET_CLASSES_FOR_REPLACEMENT = [0, 1]
 SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"
 MASKRCNN_MODEL_PATH = "weights/mask_rcnn_fish_model_2048.pth"
 
-# MODIFICADO: SAM2 models - one per class (scalable)
+# SAM2 models - one per class (scalable)
 SAM2_MODEL_PATHS = {
     0: "weights/sam2_chromis_2048.pth",
     1: "weights/sam2_coris_2048.pth"
 }
 
 # Training parameters
-NUM_EPOCHS = 300
+NUM_EPOCHS = 100
 BATCH_SIZE = 1
 LEARNING_RATE = 5e-6
 
-# MODIFICADO: Both use IMG_SIZE=2048
+# Input image size
 MASKRCNN_IMG_SIZE = 2048
 SAM2_IMG_SIZE = 2048
 
+# Mask R-CNN mask resolution
+MASK_RESOLUTION = 112  # Can be 28, 56, or 112
+
 GRADIENT_ACCUMULATION_STEPS = 2
 DICE_WEIGHT = 2.0
-MAX_INSTANCES_PER_IMAGE = 15
+MAX_INSTANCES_PER_IMAGE = 100
 
 # Output
 REPORT_OUTPUT_PATH = 'results'
@@ -104,6 +107,11 @@ UPLOAD_FOLDER = os.path.join(DATASET_PATH, 'upload')
 ORIGINAL_YOLO_DATA_YAML = os.path.join(
     DATASET_PATH, 'original_yolo/data.yaml'
 )
+
+# Mask R-CNN Inference Output (STANDALONE)
+INFERENCE_MASKRCNN_FOLDER = os.path.join(DATASET_PATH, 'inference_maskrcnn')
+OUTPUT_MASKRCNN_LABELS = os.path.join(INFERENCE_MASKRCNN_FOLDER, 'labels')
+OUTPUT_MASKRCNN_IMAGES = os.path.join(INFERENCE_MASKRCNN_FOLDER, 'images')
 
 # Class mapping
 CLASS_NAMES_MAPPING = {i: name for i, name in enumerate(CLASSES_TO_KEEP)}
@@ -193,7 +201,8 @@ def train_maskrcnn():
     print_header("STEP 1: TRAINING MASK R-CNN")
     print(f"Model: {MASKRCNN_MODEL_PATH}")
     print(f"Epochs: {NUM_EPOCHS}")
-    print(f"IMG_SIZE: {MASKRCNN_IMG_SIZE}")  # ADD THIS LINE
+    print(f"IMG_SIZE: {MASKRCNN_IMG_SIZE}")
+    print(f"MASK_RESOLUTION: {MASK_RESOLUTION}")
     print(f"Classes: {CLASSES_TO_KEEP}")
     
     try:
@@ -204,7 +213,8 @@ def train_maskrcnn():
             "--num_epochs", str(NUM_EPOCHS),
             "--batch_size", str(BATCH_SIZE),
             "--learning_rate", str(LEARNING_RATE),
-            "--img_size", str(MASKRCNN_IMG_SIZE)  # ADD THIS LINE
+            "--img_size", str(MASKRCNN_IMG_SIZE),
+            "--mask_resolution", str(MASK_RESOLUTION)
         ]
         
         print(f"\nRunning Mask R-CNN training...")
@@ -216,6 +226,50 @@ def train_maskrcnn():
         sys.exit(1)
     except FileNotFoundError:
         print("✗ ERROR: src/utils/train.py not found")
+        sys.exit(1)
+
+
+# =============================================================================
+# STEP 1.5: MASK R-CNN STANDALONE INFERENCE
+# =============================================================================
+
+def run_maskrcnn_inference():
+    """Run standalone Mask R-CNN inference (before SAM2 training)."""
+    print_header("STEP 1.5: MASK R-CNN STANDALONE INFERENCE")
+    print(f"Model: {MASKRCNN_MODEL_PATH}")
+    print(f"IMG_SIZE: {MASKRCNN_IMG_SIZE}")
+    print(f"MASK_RESOLUTION: {MASK_RESOLUTION}")
+    print(f"Output: {OUTPUT_MASKRCNN_LABELS}")
+    
+    # Clean inference folders
+    if os.path.exists(INFERENCE_MASKRCNN_FOLDER):
+        print(f"\nCleaning existing Mask R-CNN inference folder...")
+        shutil.rmtree(INFERENCE_MASKRCNN_FOLDER)
+    
+    try:
+        cmd = [
+            sys.executable, "src/utils/infer_maskrcnn.py",
+            "--maskrcnn_model", MASKRCNN_MODEL_PATH,
+            "--input_folder", os.path.join(DATASET_PATH, "test"),
+            "--output_labels", OUTPUT_MASKRCNN_LABELS,
+            "--output_images", OUTPUT_MASKRCNN_IMAGES,
+            "--detection_threshold", "0.5",
+            "--maskrcnn_img_size", str(MASKRCNN_IMG_SIZE),
+            "--mask_resolution", str(MASK_RESOLUTION),
+            "--class_names", json.dumps(CLASS_NAMES_MAPPING)
+        ]
+        
+        print(f"\nRunning Mask R-CNN inference...")
+        result = subprocess.run(cmd, check=True)
+        print("✓ Mask R-CNN inference completed")
+        print(f"  Labels saved to: {OUTPUT_MASKRCNN_LABELS}")
+        print(f"  Images saved to: {OUTPUT_MASKRCNN_IMAGES}")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"✗ ERROR: Mask R-CNN inference failed (code {e.returncode})")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("✗ ERROR: src/utils/infer_maskrcnn.py not found")
         sys.exit(1)
 
 
@@ -368,14 +422,14 @@ def create_upload_folder():
     try:
         cmd = [
             sys.executable, "src/utils/adapt2rbf.py",
-            "--inferencefolder", OUTPUT_LABELS_FOLDER,
-            "--originalfolder", os.path.join(DATASET_PATH,
+            "--inference_folder", OUTPUT_LABELS_FOLDER,
+            "--original_folder", os.path.join(DATASET_PATH,
                                              "original_yolo/test/labels"),
-            "--outputfolder", os.path.join(INFERENCE_FOLDER_PATH,
+            "--output_folder", os.path.join(INFERENCE_FOLDER_PATH,
                                             "labels_full"),
-            "--targetclasses", json.dumps(TARGET_CLASSES_FOR_REPLACEMENT),
-            "--uploadfolder", UPLOAD_FOLDER,
-            "--originalimgfolder", os.path.join(DATASET_PATH, "test")
+            "--target_classes", json.dumps(TARGET_CLASSES_FOR_REPLACEMENT),
+            "--upload_folder", UPLOAD_FOLDER,
+            "--original_img_folder", os.path.join(DATASET_PATH, "test")
         ]
         
         print(f"\nRunning adapt2rbf...")
@@ -439,7 +493,7 @@ Examples:
         '--mode',
         type=str,
         choices=['full', 'setup', 'train-maskrcnn', 'train-sam2',
-                 'train-sam2-class', 'inference'],
+                 'train-sam2-class', 'inference', 'inference-maskrcnn'],
         default='full',
         help='Execution mode'
     )
@@ -480,6 +534,7 @@ Examples:
         elif args.mode == 'train-maskrcnn':
             # Only train Mask R-CNN
             train_maskrcnn()
+            run_maskrcnn_inference()
             
         elif args.mode == 'train-sam2':
             # Train all SAM2 models (requires Mask R-CNN)
@@ -503,7 +558,14 @@ Examples:
                 sys.exit(1)
             
             train_sam2_per_class(args.class_index)
-            
+
+        elif args.mode == 'inference-maskrcnn':
+            # Only Mask R-CNN inference
+            if not os.path.exists(MASKRCNN_MODEL_PATH):
+                print(f"✗ ERROR: Mask R-CNN model not found: {MASKRCNN_MODEL_PATH}")
+                sys.exit(1)
+            run_maskrcnn_inference()
+
         elif args.mode == 'inference':
             # Only inference + upload (requires all models)
             if not os.path.exists(MASKRCNN_MODEL_PATH):
@@ -557,3 +619,4 @@ Examples:
 if __name__ == "__main__":
     main()
     # --mode full
+    # --mode inference

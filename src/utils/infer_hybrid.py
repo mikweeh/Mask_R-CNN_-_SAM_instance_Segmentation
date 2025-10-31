@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 import json
 from pathlib import Path
+from shapely import Polygon as ShapelyPolygon
 
 # SAM2 imports
 try:
@@ -51,6 +52,15 @@ MIN_MASK_AREA = 100  # Minimum mask size in pixels
 
 # Class names
 CLASS_NAMES = {0: "Chromis chromis", 1: "Coris julis"}
+
+# Tolerance of polygon simplification
+TOL = 0
+
+# Threshold to consider pixel is mask (0-1)
+THRESHOLD = 0.99
+
+# Erode operation after getting masks
+ERODE_ITERATIONS = 2
 
 # =============================================================================
 # MASK R-CNN LOADING
@@ -158,7 +168,7 @@ def load_maskrcnn_model(model_path, num_classes=2, device='cuda'):
             return x
     
     # Load pre-trained base model
-    model = maskrcnn_resnet50_fpn(pretrained=False)
+    model = maskrcnn_resnet50_fpn(weights=None)
     
     # Replace the classifier head
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -205,34 +215,45 @@ def load_maskrcnn_model(model_path, num_classes=2, device='cuda'):
 # SAM2 LOADING
 # =============================================================================
 
-def load_sam2_predictor(model_id, fine_tuned_weights_path, device):
+def load_sam2_predictor(model_path, model_id, device='cuda'):
     """
-    Load fine-tuned SAM2 predictor.
+    Load SAM2 predictor with fine-tuned weights.
     
     Args:
-        model_id: Hugging Face model ID
-        fine_tuned_weights_path: Path to fine-tuned weights
-        device: Device to load model on
+        model_path: Path to fine-tuned SAM2 checkpoint
+        model_id: SAM2 model ID (e.g., 'facebook/sam2.1-hiera-large')
+        device: Device to load on
     
     Returns:
-        SAM2ImagePredictor instance
+        SAM2ImagePredictor with loaded weights
     """
-    print(f"Loading SAM2 predictor from: {model_id}")
+    print(f"Loading SAM2 model from: {model_path}")
     
+    # First load the base model from HuggingFace
     predictor = SAM2ImagePredictor.from_pretrained(model_id)
-    predictor.model.to(device)
     
-    if os.path.exists(fine_tuned_weights_path):
-        print(f"Loading fine-tuned SAM2 weights: "
-              f"{fine_tuned_weights_path}")
-        state_dict = torch.load(fine_tuned_weights_path,
-                                 map_location=device)
-        predictor.model.load_state_dict(state_dict)
-        print("Fine-tuned SAM2 weights loaded successfully")
+    # Then load your fine-tuned weights
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Handle different checkpoint formats
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            # Assume the entire dict is the state_dict
+            state_dict = checkpoint
     else:
-        print(f"WARNING: Fine-tuned weights not found, using base SAM2")
+        # Checkpoint is directly the state_dict
+        state_dict = checkpoint
     
+    # Load the state dict into the model
+    predictor.model.load_state_dict(state_dict, strict=False)
+    predictor.model.to(device)
     predictor.model.eval()
+    
+    print(f"✓ SAM2 model loaded successfully")
     return predictor
 
 
@@ -325,6 +346,178 @@ def run_maskrcnn_inference(model, image_rgb, confidence_threshold=0.5,
     return detections
 
 
+def mask_to_yolo_segmentation(mask, class_id, image_shape, tolerance=None):
+    """
+    Convert binary mask to YOLO segmentation format with proper polygon
+    simplification.
+    
+    Uses Shapely's Douglas-Peucker algorithm for professional polygon
+    simplification (same method as label_simplify.py).
+    
+    Args:
+        mask: Binary mask (H, W) - can be 0/1 or probability values
+        class_id: Class ID for this mask
+        image_shape: Tuple (height, width) of the image
+        tolerance: Simplification tolerance (default: 2.0)
+                  Higher values = more simplification
+    
+    Returns:
+        YOLO format string: "class_id x1 y1 x2 y2 ... xn yn"
+        Returns None if mask is empty or invalid
+    """
+    # Convert to numpy if tensor
+    if isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+    
+    # Ensure mask is 2D
+    if mask.ndim == 3:
+        mask = mask.squeeze()
+    
+    # Binarize mask
+    unique_vals = np.unique(mask)
+    if len(unique_vals) <= 2 and np.all(np.isin(unique_vals, [0, 1])):
+        binary_mask = mask.astype(np.uint8)
+    else:
+        binary_mask = (mask > THRESHOLD).astype(np.uint8)
+    
+    # Check if mask has any positive pixels
+    if not np.any(binary_mask):
+        return None
+    
+    if ERODE_ITERATIONS > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary_mask = cv2.erode(binary_mask, kernel, 
+                               iterations=ERODE_ITERATIONS)
+        
+        # Check again after erosion
+        if not np.any(binary_mask):
+            return None
+
+    # Find contours
+    contours, _ = cv2.findContours(
+        binary_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+    
+    if not contours:
+        return None
+    
+    # Get largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # Check minimum area
+    if cv2.contourArea(largest_contour) < 10:
+        return None
+    
+    # Convert contour to list of points
+    contour_points = largest_contour.reshape(-1, 2)
+    
+    # Convert to list of tuples for Shapely
+    points = [(int(pt[0]), int(pt[1])) for pt in contour_points]
+    
+    # Check minimum points
+    if len(points) < 3:
+        return None
+    
+    try:
+        # Create Shapely polygon
+        polygon = ShapelyPolygon(points)
+        
+        # Simplify using Douglas-Peucker algorithm
+        if tolerance is not None and tolerance > 0:
+            simplified_polygon = polygon.simplify(
+                tolerance=tolerance,
+                preserve_topology=True
+            )
+            final_points = list(simplified_polygon.exterior.coords)[:-1]
+        else:
+            # Or no simplification
+            final_points = points
+        
+        # Safety check: ensure we have at least 3 points
+        if len(final_points) < 3:
+            # Fall back to original points if over-simplified
+            final_points = points
+        
+        # Normalize coordinates to [0, 1]
+        height, width = image_shape
+        normalized_points = []
+        
+        for x, y in final_points:
+            x_norm = max(0.0, min(1.0, x / width))
+            y_norm = max(0.0, min(1.0, y / height))
+            normalized_points.extend([x_norm, y_norm])
+        
+        # Format as YOLO string
+        yolo_str = (f"{class_id} " + 
+                   " ".join(f"{p:.6f}" for p in normalized_points))
+        
+        return yolo_str
+        
+    except Exception as e:
+        print(f"Warning: Error in polygon simplification: {e}")
+        return None
+
+
+def save_visualization_image(image_rgb, masks_data, class_names, 
+                            output_path, alpha=0.4):
+    """
+    Create and save visualization with overlaid masks.
+    
+    Args:
+        image_rgb: Original image in RGB format
+        masks_data: List of (mask, class_id) tuples
+        class_names: Dict mapping class_id to class_name
+        output_path: Where to save the visualization
+        alpha: Transparency of overlay (default: 0.4)
+    """
+    # Convert RGB to BGR for OpenCV
+    result_image = cv2.cvtColor(image_rgb.copy(), cv2.COLOR_RGB2BGR)
+    
+    # Define colors for different classes (BGR format for OpenCV)
+    class_colors = {
+        0: (0, 255, 0),    # Green for class 0
+        1: (255, 0, 0),    # Blue for class 1
+        2: (0, 0, 255),    # Red for class 2 (if needed)
+    }
+    
+    # Process each mask
+    for mask, class_id in masks_data:
+        # Convert mask to binary
+        if isinstance(mask, torch.Tensor):
+            mask = mask.cpu().numpy()
+        
+        if mask.ndim == 3:
+            mask = mask.squeeze()
+        
+        binary_mask = (mask > 0.5).astype(np.uint8)
+        
+        if not np.any(binary_mask):
+            continue
+        
+        # Get color for this class
+        color = class_colors.get(class_id, (255, 255, 255))
+        
+        # Create colored mask overlay
+        colored_mask = np.zeros_like(result_image)
+        colored_mask[binary_mask == 1] = color
+        
+        # Apply transparency
+        mask_area = binary_mask == 1
+        if np.any(mask_area):
+            result_image[mask_area] = cv2.addWeighted(
+                result_image[mask_area],
+                1.0 - alpha,
+                colored_mask[mask_area],
+                alpha,
+                0
+            )
+    
+    # Save the visualization
+    cv2.imwrite(output_path, result_image)
+
+
 def process_all_images_hybrid(maskrcnn_model, sam2_predictors,
                               class_names, input_folder, output_labels,
                               output_images, maskrcnn_img_size=2048):
@@ -399,7 +592,7 @@ def process_all_images_hybrid(maskrcnn_model, sam2_predictors,
         )
         print(f"  Detected: {summary}")
     
-    # PHASE 2+: Sequential SAM2 processing per class
+    # PHASE 2: Sequential SAM2 processing per class
     # ==============================================
     annotations_by_image = {img_path: [] for img_path in all_detections}
     
@@ -447,7 +640,8 @@ def process_all_images_hybrid(maskrcnn_model, sam2_predictors,
                     yolo_str = mask_to_yolo_segmentation(
                         refined_mask,
                         det['class'],
-                        image_rgb.shape[:2]
+                        image_rgb.shape[:2],
+                        tolerance=TOL
                     )
                     if yolo_str:
                         annotations_by_image[img_path].append(yolo_str)
@@ -456,6 +650,53 @@ def process_all_images_hybrid(maskrcnn_model, sam2_predictors,
         print(f"\n  Unloading SAM2 model for {class_name}...")
         del predictor
         torch.cuda.empty_cache()
+
+    # PHASE 3: Save visualization images
+    # =========================================================================
+    print("\n" + "="*80)
+    print("SAVING VISUALIZATION IMAGES")
+    print("="*80)
+    
+    for img_path, yolo_annotations in annotations_by_image.items():
+        img_file = all_detections[img_path]['img_file']
+        image_rgb = all_detections[img_path]['image_rgb']
+        base_name = os.path.splitext(img_file)[0]
+        
+        # Reconstruct masks from YOLO annotations for visualization
+        h, w = image_rgb.shape[:2]
+        masks_for_viz = []
+        
+        for yolo_str in yolo_annotations:
+            parts = yolo_str.split()
+            class_id = int(parts[0])
+            coords = list(map(float, parts[1:]))
+            
+            # Convert normalized coordinates back to pixels
+            points = []
+            for i in range(0, len(coords), 2):
+                x = int(coords[i] * w)
+                y = int(coords[i+1] * h)
+                points.append([x, y])
+            
+            # Create mask from polygon
+            mask = np.zeros((h, w), dtype=np.uint8)
+            if len(points) >= 3:
+                cv2.fillPoly(mask, [np.array(points)], 1)
+                masks_for_viz.append((mask, class_id))
+        
+        # Save visualization
+        viz_output_path = os.path.join(
+            output_images, 
+            f"{base_name}.jpg"
+        )
+        save_visualization_image(
+            image_rgb,
+            masks_for_viz,
+            class_names,
+            viz_output_path,
+            alpha=0.4
+        )
+        print(f"  Saved visualization: {base_name}.jpg")
     
     # PHASE FINAL: Save annotations
     # =============================
@@ -503,11 +744,16 @@ def refine_mask_with_sam2(predictor, image_rgb, bbox):
     # Use bbox as prompt
     masks, scores, logits = predictor.predict(
         box=bbox,
-        multimask_output=False  # Single best mask
+        multimask_output=True,
+        return_logits=False
     )
     
-    # Return the mask (shape: H, W)
-    return masks[0].astype(np.uint8)
+    if len(masks) > 0:
+        best_idx = np.argmax(scores)
+        best_mask = masks[best_idx]
+        return best_mask.astype(np.uint8)
+    
+    return None
 
 
 def mask_to_yolo_polygon(mask, class_id):
@@ -638,10 +884,10 @@ def create_visualization(image_path, yolo_annotations, output_path):
         cv2.polylines(image, [points], True, colors[class_id], 2)
         
         # Add class label
-        cx = int(np.mean(points[:, 0]))
-        cy = int(np.mean(points[:, 1]))
-        cv2.putText(image, CLASS_NAMES[class_id], (cx, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[class_id], 2)
+        # cx = int(np.mean(points[:, 0]))
+        # cy = int(np.mean(points[:, 1]))
+        # cv2.putText(image, CLASS_NAMES[class_id], (cx, cy),
+        #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[class_id], 2)
     
     cv2.imwrite(output_path, image)
 
@@ -711,7 +957,7 @@ def main():
     
     # Load Mask R-CNN model
     print("\nLoading Mask R-CNN model...")
-    num_classes = len(class_names) + 1  # +1 for background
+    num_classes = len(class_names)
     maskrcnn_model = load_maskrcnn_model(args.maskrcnn_model, num_classes)
     print("✓ Mask R-CNN model loaded")
     
@@ -724,7 +970,8 @@ def main():
         print(f"  Loading SAM2 for {class_name}...")
         sam2_predictors[class_idx] = load_sam2_predictor(
             model_path,
-            args.sam2_model_id
+            args.sam2_model_id,
+            DEVICE
         )
         print(f"  ✓ SAM2 for {class_name} loaded")
     

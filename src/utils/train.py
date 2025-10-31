@@ -71,7 +71,7 @@ VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH,
 # Training parameters
 NUM_CLASSES = 3
 BATCH_SIZE = 1
-NUM_EPOCHS = 200
+NUM_EPOCHS = 100
 LEARNING_RATE = 0.0001
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -79,15 +79,15 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 IMG_SIZE = 2048
 CONFIDENCE_THRESHOLD = 0.3
 DICE_WEIGHT = 0.0
-USE_FOCAL_DICE = False
+USE_FOCAL_DICE = True
 OVERSAMPLE_SMALL_OBJECTS = True
 USE_COPY_PASTE = True
-MASK_RESOLUTION = 56
+MASK_RESOLUTION = 112
 BASE_MIN_ANCHOR = 16
 
 # RPN parameters
-RPN_PRE_NMS_TOP_N_TRAIN = 1500
-RPN_POST_NMS_TOP_N_TRAIN = 600
+RPN_PRE_NMS_TOP_N_TRAIN = 400
+RPN_POST_NMS_TOP_N_TRAIN = 150
 RPN_NMS_THRESH = 0.6
 
 # Report configuration
