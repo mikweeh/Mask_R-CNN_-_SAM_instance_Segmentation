@@ -20,6 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
@@ -35,6 +36,7 @@ warnings.filterwarnings("ignore")
 from datetime import datetime
 import random
 from PIL import Image
+from maskrcnn_loader import HighResMaskRCNNPredictor
 
 # PDF generation imports
 try:
@@ -276,23 +278,12 @@ def update_global_variables(args):
 
 def copy_paste_small_objects(image, masks, boxes, labels, max_copies=2):
     """
-    Memory-optimized copy-paste augmentation for small objects.
-    
-    Args:
-        image: Input image array
-        masks: Object masks
-        boxes: Bounding boxes
-        labels: Object labels
-        max_copies: Maximum number of copies per object
-        
-    Returns:
-        Augmented image, masks, boxes, and labels
+    Enhanced copy-paste with random augmentations for each copied object.
     """
     if len(boxes) == 0:
         return image, masks, boxes, labels
         
-    # Limit augmentation for very small datasets or single-item batches
-    if len(boxes) > 20:  # Skip copy-paste if too many objects already
+    if len(boxes) > 20:
         return image, masks, boxes, labels
         
     h, w = image.shape[:2]
@@ -300,18 +291,15 @@ def copy_paste_small_objects(image, masks, boxes, labels, max_copies=2):
     new_boxes = boxes.copy()
     new_labels = labels.copy()
     
-    # Reduce number of copies for memory efficiency
     max_copies = min(max_copies, 6)
     
     for i in range(len(boxes)):
-        # Only copy small objects
         box_area = (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1])
         if box_area < (h * w * 0.01):
             num_copies = np.random.randint(1, max_copies + 1)
             
             for _ in range(num_copies):
                 try:
-                    # Extract object region with error handling
                     x1, y1, x2, y2 = boxes[i].astype(int)
                     mask = masks[i]
                     mask_h, mask_w = y2 - y1, x2 - x1
@@ -319,12 +307,11 @@ def copy_paste_small_objects(image, masks, boxes, labels, max_copies=2):
                     if mask_h <= 0 or mask_w <= 0:
                         continue
                     
-                    # Try to place the copied object (fewer attempts)
-                    for attempt in range(5):  # Reduced from 10 to 5
+                    for attempt in range(5):
                         new_x = np.random.randint(0, max(1, w - mask_w))
                         new_y = np.random.randint(0, max(1, h - mask_h))
                         
-                        # Check for overlap
+                        # Check overlap
                         overlap = False
                         for existing_box in new_boxes:
                             if (new_x < existing_box[2] and new_x + mask_w > existing_box[0] and
@@ -333,9 +320,101 @@ def copy_paste_small_objects(image, masks, boxes, labels, max_copies=2):
                                 break
                         
                         if not overlap:
-                            # Create new mask with bounds checking
                             new_mask = np.zeros_like(masks[0])
                             object_mask = mask[y1:y2, x1:x2]
+                            object_region = image[y1:y2, x1:x2].copy()
+                            
+                            # ============================================
+                            # APPLY AGGRESSIVE AUGMENTATIONS HERE
+                            # ============================================
+                            
+                            # 1. Random rotation (-45° to +45°)
+                            rotation_angle = np.random.uniform(-45, 45)
+                            obj_h, obj_w = object_region.shape[:2]
+                            
+                            # Get rotation matrix (rotate around center)
+                            center = (obj_w / 2, obj_h / 2)
+                            rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                            
+                            # Calculate new bounding dimensions after rotation
+                            cos = np.abs(rotation_matrix[0, 0])
+                            sin = np.abs(rotation_matrix[0, 1])
+                            new_w_rot = int((obj_h * sin) + (obj_w * cos))
+                            new_h_rot = int((obj_h * cos) + (obj_w * sin))
+                            
+                            # Adjust the rotation matrix to take into account translation
+                            rotation_matrix[0, 2] += (new_w_rot / 2) - center[0]
+                            rotation_matrix[1, 2] += (new_h_rot / 2) - center[1]
+                            
+                            # Apply rotation to both image and mask
+                            object_region = cv2.warpAffine(
+                                object_region, rotation_matrix, (new_w_rot, new_h_rot),
+                                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                            )
+                            object_mask = cv2.warpAffine(
+                                object_mask.astype(np.uint8), rotation_matrix, (new_w_rot, new_h_rot),
+                                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+                            )
+                            
+                            # 2. Random horizontal flip
+                            if np.random.rand() > 0.5:
+                                object_region = np.fliplr(object_region)
+                                object_mask = np.fliplr(object_mask)
+                            
+                            # 3. Random vertical flip
+                            if np.random.rand() > 0.5:
+                                object_region = np.flipud(object_region)
+                                object_mask = np.flipud(object_mask)
+                            
+                            # 4. Random brightness adjustment
+                            brightness_factor = np.random.uniform(0.7, 1.3)
+                            object_region = np.clip(object_region * brightness_factor, 0, 255).astype(np.uint8)
+                            
+                            # 5. Random contrast adjustment
+                            if np.random.rand() > 0.5:
+                                contrast_factor = np.random.uniform(0.8, 1.2)
+                                mean = object_region.mean()
+                                object_region = np.clip((object_region - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
+                            
+                            # 6. Random scale (subtle)
+                            if np.random.rand() > 0.5:
+                                scale_factor = np.random.uniform(0.9, 1.1)
+                                new_h_scale = int(object_region.shape[0] * scale_factor)
+                                new_w_scale = int(object_region.shape[1] * scale_factor)
+                                if new_h_scale > 0 and new_w_scale > 0:
+                                    object_region = cv2.resize(object_region, (new_w_scale, new_h_scale))
+                                    object_mask = cv2.resize(object_mask.astype(np.uint8), (new_w_scale, new_h_scale))
+                            
+                            # 7. Add Gaussian noise
+                            if np.random.rand() > 0.7:
+                                noise = np.random.normal(0, 10, object_region.shape).astype(np.int16)
+                                object_region = np.clip(object_region.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+                            
+                            # ============================================
+                            # END AUGMENTATIONS
+                            # ============================================
+                            
+                            # Update dimensions after transformations
+                            mask_h, mask_w = object_mask.shape[:2]
+                            
+                            # Recalculate placement if size changed
+                            if mask_w > w or mask_h > h:
+                                # Object too large after rotation, skip
+                                continue
+                                
+                            new_x = np.random.randint(0, max(1, w - mask_w))
+                            new_y = np.random.randint(0, max(1, h - mask_h))
+                            
+                            # Check overlap again with new size
+                            overlap = False
+                            for existing_box in new_boxes:
+                                if (new_x < existing_box[2] and new_x + mask_w > existing_box[0] and
+                                    new_y < existing_box[3] and new_y + mask_h > existing_box[1]):
+                                    overlap = True
+                                    break
+                            
+                            if overlap:
+                                continue
                             
                             end_y = min(new_y + mask_h, h)
                             end_x = min(new_x + mask_w, w)
@@ -343,8 +422,6 @@ def copy_paste_small_objects(image, masks, boxes, labels, max_copies=2):
                             actual_w = end_x - new_x
                             
                             if actual_h > 0 and actual_w > 0:
-                                # Apply augmentation
-                                object_region = image[y1:y2, x1:x2]
                                 resized_region = cv2.resize(object_region, (actual_w, actual_h))
                                 resized_mask = cv2.resize(object_mask.astype(np.uint8), (actual_w, actual_h))
                                 
@@ -352,18 +429,16 @@ def copy_paste_small_objects(image, masks, boxes, labels, max_copies=2):
                                 image[new_y:end_y, new_x:end_x][mask_bool] = resized_region[mask_bool]
                                 new_mask[new_y:end_y, new_x:end_x] = resized_mask
                                 
-                                # Add new annotations
                                 new_masks = np.concatenate([new_masks, new_mask[None, ...]])
-                                new_boxes = np.concatenate([new_boxes, 
-                                                          [[new_x, new_y, end_x, end_y]]])
+                                new_boxes = np.concatenate([new_boxes, [[new_x, new_y, end_x, end_y]]])
                                 new_labels = np.concatenate([new_labels, [labels[i]]])
                                 break
                                 
                 except Exception as e:
-                    # Skip this copy if there's an error
                     continue
     
     return image, new_masks, new_boxes, new_labels
+
 
 # =============================================================================
 # ENHANCED AUGMENTATION CONFIGURATION
@@ -635,7 +710,7 @@ class COCOInstanceDataset(Dataset):
                 regular_images.append(image_id)
         
         # Oversample small object images (repeat n times)
-        oversampled_ids = regular_images + small_object_images * 3
+        oversampled_ids = regular_images + small_object_images * 5
         return oversampled_ids
 
     def __len__(self):
@@ -771,81 +846,6 @@ def get_model_instance_segmentation(num_classes, mask_resolution=28):
     print(f"Mask ROI pool size set to: {roi_pool_size}×{roi_pool_size}")
     print(f"Target mask resolution: {mask_resolution}×{mask_resolution}")
     
-    # Create custom mask predictor for higher resolution
-    class HighResMaskRCNNPredictor(nn.Module):
-        def __init__(self, in_channels, dim_reduced, num_classes, mask_size):
-            super().__init__()
-            self.mask_size = mask_size
-
-            # Reduce hidden dimension for high-resolution masks
-            if mask_size <= 56:
-                hidden_dim = dim_reduced
-            else:
-                hidden_dim = dim_reduced // 2  # 256 -> 128 for memory
-
-            # Determine number of conv layers based on resolution
-            if mask_size <= 28:
-                # Standard configuration for 28×28
-                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
-                self.relu = nn.ReLU(inplace=True)
-                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
-                
-            elif mask_size <= 56:
-                # Enhanced configuration for 56×56
-                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
-                self.relu1 = nn.ReLU(inplace=True)
-                self.conv6_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
-                self.relu2 = nn.ReLU(inplace=True)
-                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
-                
-            elif mask_size <= 112:
-                # Advanced configuration for 112×112
-                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, hidden_dim, 2, 2, 0)
-                self.relu1 = nn.ReLU(inplace=True)
-                self.conv6_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
-                self.relu2 = nn.ReLU(inplace=True)
-                self.conv7_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
-                self.relu3 = nn.ReLU(inplace=True)
-                self.mask_fcn_logits = nn.Conv2d(hidden_dim, num_classes, 1, 1, 0)
-                
-            else:
-                raise ValueError(f"Mask resolution {mask_size} not supported. Use 28, 56, or 112.")
-            
-            # Initialize weights
-            for name, param in self.named_parameters():
-                if "weight" in name:
-                    nn.init.kaiming_normal_(param, mode="fan_out", nonlinearity="relu")
-                elif "bias" in name:
-                    nn.init.constant_(param, 0)
-        
-        def forward(self, x):
-            if self.mask_size <= 28:
-                x = self.conv5_mask(x)
-                x = self.relu(x)
-                x = self.mask_fcn_logits(x)
-                
-            elif self.mask_size <= 56:
-                x = self.conv5_mask(x)
-                x = self.relu1(x)
-                x = self.conv6_mask(x)
-                x = self.relu2(x)
-                x = self.mask_fcn_logits(x)
-                
-            elif self.mask_size <= 112:
-                x = self.relu1(self.conv5_mask(x))
-                torch.cuda.empty_cache()
-                x = self.relu2(self.conv6_mask(x))
-                torch.cuda.empty_cache()
-                x = self.relu3(self.conv7_mask(x))
-                torch.cuda.empty_cache()
-                x = self.mask_fcn_logits(x)
-            
-                # Crop to exact size if needed
-                if x.shape[-1] != self.mask_size:
-                    x = F.interpolate(x, size=(self.mask_size, self.mask_size), 
-                                    mode='bilinear', align_corners=False)
-            return x
-    
     # Optimize anchor generator for small objects
     anchor_generator = torchvision.models.detection.anchor_utils.AnchorGenerator(
         sizes=tuple((size,) for size in get_anchor_sizes(IMG_SIZE, base_min_anchor=BASE_MIN_ANCHOR)),
@@ -897,7 +897,8 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
     num_batches = 0
     num_matched_pairs = 0
 
-    for batch_idx, (images, targets) in enumerate(data_loader):
+    for batch_idx, (images, targets) in enumerate(tqdm(data_loader,
+        desc="Batches", ncols=80, leave=True, dynamic_ncols=False)):
         images = [image.to(device) for image in images]
         targets = [{k: v.to(device) for k, v in t.items()}
                   for t in targets]

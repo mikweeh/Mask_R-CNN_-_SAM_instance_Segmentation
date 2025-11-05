@@ -1,0 +1,182 @@
+# =============================================================================
+# FISH SEGMENTATION PIPELINE - CONFIGURATION FILE
+# =============================================================================
+# This file contains all configuration variables for the entire pipeline
+# Last updated: 2024
+
+# =============================================================================
+# DATASET CONFIGURATION
+# =============================================================================
+dataset:
+  # Root dataset path
+  dataset_path: "dataset"
+  
+  # Classes to keep and their mapping
+  classes_to_keep:
+    - "Chromis chromis"
+    - "Coris julis"
+  
+  # Target classes for replacement in adapt2rbf
+  target_classes_for_replacement:
+    - 0
+    - 1
+  
+  # Class mapping (COCO class IDs to YOLO class IDs) for Mask R-CNN training
+  class_mapping:
+    1: 0  # COCO class 1 -> YOLO class 0
+    2: 1  # COCO class 2 -> YOLO class 1
+  
+  # Class names mapping (YOLO class ID to class name)
+  class_names_mapping:
+    0: "Chromis chromis"
+    1: "Coris julis"
+  
+  # Target class index for SAM2 training (when training per-class models)
+  target_class_index: 0
+
+# =============================================================================
+# MODEL PATHS
+# =============================================================================
+models:
+  # Mask R-CNN model path
+  maskrcnn_model_path: "weights/m10.pth"  # "weights/mask_rcnn_fish_model_2048.pth"
+  
+  # SAM2 model ID (HuggingFace)
+  sam2_model_id: "facebook/sam2.1-hiera-large"
+  
+  # SAM2 model paths (one per class)
+  sam2_model_paths:
+    0: "weights/sam2_chromis_2048.pth"
+    1: "weights/sam2_coris_2048.pth"
+
+# =============================================================================
+# TRAINING PARAMETERS - MASK R-CNN
+# =============================================================================
+training_maskrcnn:
+  # Number of classes (including background)
+  num_classes: 3
+  
+  # Basic training parameters
+  num_epochs: 1
+  batch_size: 1
+  learning_rate: 0.0001
+  
+  # Image size
+  img_size: 2048
+  
+  # Confidence threshold for predictions
+  confidence_threshold: 0.3
+  
+  # Loss weights
+  dice_weight: 0.0
+  loss_mask_weight: 1.5
+  
+  # Training options (boolean flags)
+  use_focal_dice: true
+  oversample_small_objects: true
+  use_copy_paste: true
+  
+  # Mask resolution (28, 56, or 112)
+  mask_resolution: 112
+  
+  # Anchor parameters
+  base_min_anchor: 16
+  
+  # RPN parameters
+  rpn_pre_nms_top_n_train: 400
+  rpn_post_nms_top_n_train: 150
+  rpn_nms_thresh: 0.6
+  
+  # Small object parameters
+  small_object_max_area: 1000  # pixels
+
+# =============================================================================
+# TRAINING PARAMETERS - SAM2
+# =============================================================================
+training_sam2:
+  # Number of classes for SAM2 (typically 1 for binary segmentation)
+  num_classes: 1
+  
+  # Basic training parameters
+  num_epochs: 1
+  batch_size: 1
+  learning_rate: 0.000005  # 5e-6
+  
+  # Image size (optimal for SAM2)
+  img_size: 2048
+  
+  # Gradient accumulation
+  gradient_accumulation_steps: 2
+  
+  # Loss weight for Dice loss
+  dice_weight: 2.0
+  
+  # Max instances per image
+  max_instances_per_image: 100
+  
+  # Mask parameters
+  mask_threshold: 0.5
+  min_mask_area: 100
+  
+  # Train unified model (all classes together) or per-class
+  train_unified: false
+
+# =============================================================================
+# INFERENCE PARAMETERS
+# =============================================================================
+inference:
+  # Detection threshold
+  detection_threshold: 0.5
+  
+  # Minimum mask area (pixels)
+  min_mask_area: 100
+  
+  # Polygon simplification tolerance
+  polygon_tolerance: 0
+  
+  # Threshold to consider pixel as mask (0-1)
+  mask_threshold: 0.95
+  
+  # Erode iterations for hybrid inference
+  erode_iterations: 0
+  
+  # Mask threshold for SAM2 (0.8 for maskrcnn standalone)
+  maskrcnn_mask_threshold: 0.8
+
+# =============================================================================
+# OUTPUT PATHS
+# =============================================================================
+output:
+  # Report output path
+  report_output_path: "results"
+  
+  # Hybrid inference output (Mask R-CNN + SAM2)
+  inference_folder_path: "dataset/inference"
+  output_labels_folder: "dataset/inference/labels"
+  output_images_folder: "dataset/inference/images"
+  output_labels_full_folder: "dataset/inference/labels_full"
+  
+  # Mask R-CNN standalone inference output
+  inference_maskrcnn_folder: "dataset/inference_maskrcnn"
+  output_maskrcnn_labels: "dataset/inference_maskrcnn/labels"
+  output_maskrcnn_images: "dataset/inference_maskrcnn/images"
+  
+  # Upload folder for Roboflow
+  upload_folder: "dataset/upload"
+  
+  # Original YOLO data.yaml location
+  original_yolo_data_yaml: "dataset/original_yolo/data.yaml"
+  
+  # Original YOLO labels folder (for adapt2rbf)
+  original_yolo_labels_folder: "dataset/original_yolo/test/labels"
+  
+  # Original images folder
+  original_img_folder: "dataset/test"
+
+# =============================================================================
+# SYSTEM CONFIGURATION
+# =============================================================================
+system:
+  # Device will be auto-detected (cuda if available, else cpu)
+  # This is not configurable as it's determined at runtime
+  device: "auto"

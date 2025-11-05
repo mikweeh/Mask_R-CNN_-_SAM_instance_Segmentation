@@ -11,13 +11,9 @@ import torch
 import cv2
 import numpy as np
 import json
-from pathlib import Path
 
-# Mask R-CNN imports
-import torchvision
-from torchvision.models.detection import maskrcnn_resnet50_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+# Import shared model loader
+from maskrcnn_loader import load_maskrcnn_model
 
 # Configuration
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -26,135 +22,6 @@ MASK_RESOLUTION = 112
 MIN_MASK_AREA = 100
 TOL = 0  # Tolerance for polygon simplification
 THRESHOLD = 0.8  # Threshold to consider pixel is mask
-
-
-def load_maskrcnn_model(model_path, num_classes=3,
-                        mask_resolution=MASK_RESOLUTION,
-                        device='cuda'):
-    """
-    Load trained Mask R-CNN model with custom high-resolution predictor.
-    This MUST match the architecture used during training.
-    
-    Args:
-        model_path: Path to trained model weights
-        num_classes: Number of classes INCLUDING background (default: 3)
-        device: Device to load model on
-        
-    Returns:
-        Loaded Mask R-CNN model in eval mode
-    """
-    print(f"Loading Mask R-CNN model from {model_path}")
-    
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torchvision.models.detection import maskrcnn_resnet50_fpn
-    
-    # TODO: Restructure
-    # CRITICAL: This class definition MUST match train.py exactly
-    class HighResMaskRCNNPredictor(nn.Module):
-        """
-        Custom high-resolution mask predictor.
-        Supports mask_size: 28, 56, or 112.
-        """
-        
-        def __init__(self, in_channels, dim_reduced, num_classes, mask_size=112):
-            super().__init__()
-            self.mask_size = mask_size
-            
-            # Determine hidden dimension based on mask size
-            if mask_size == 56:
-                hidden_dim = dim_reduced * 2
-            else:
-                hidden_dim = dim_reduced
-            
-            # Build architecture based on mask_size
-            if mask_size == 28:
-                # 14x14 -> 28x28
-                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
-                self.relu = nn.ReLU(inplace=True)
-                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
-                
-            elif mask_size == 56:
-                # 14x14 -> 28x28 -> 56x56
-                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
-                self.relu1 = nn.ReLU(inplace=True)
-                self.conv6_mask = nn.ConvTranspose2d(dim_reduced, dim_reduced, 2, 2, 0)
-                self.relu2 = nn.ReLU(inplace=True)
-                self.mask_fcn_logits = nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)
-                
-            elif mask_size == 112:
-                # 14x14 -> 28x28 -> 56x56 -> 112x112
-                self.conv5_mask = nn.ConvTranspose2d(dim_reduced, hidden_dim, 2, 2, 0)
-                self.relu1 = nn.ReLU(inplace=True)
-                self.conv6_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
-                self.relu2 = nn.ReLU(inplace=True)
-                self.conv7_mask = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2, 0)
-                self.relu3 = nn.ReLU(inplace=True)
-                self.mask_fcn_logits = nn.Conv2d(hidden_dim, num_classes, 1, 1, 0)
-            else:
-                raise ValueError(f"Mask resolution {mask_size} not supported. Use 28, 56, or 112.")
-            
-            # Initialize weights
-            for name, param in self.named_parameters():
-                if "weight" in name:
-                    nn.init.kaiming_normal_(param, mode="fan_out", nonlinearity="relu")
-                elif "bias" in name:
-                    nn.init.constant_(param, 0)
-        
-        def forward(self, x):
-            """Forward pass through the mask predictor."""
-            if self.mask_size == 28:
-                x = self.conv5_mask(x)
-                x = self.relu(x)
-                x = self.mask_fcn_logits(x)
-                
-            elif self.mask_size == 56:
-                x = self.conv5_mask(x)
-                x = self.relu1(x)
-                x = self.conv6_mask(x)
-                x = self.relu2(x)
-                x = self.mask_fcn_logits(x)
-                
-            elif self.mask_size == 112:
-                x = self.relu1(self.conv5_mask(x))
-                x = self.relu2(self.conv6_mask(x))
-                x = self.relu3(self.conv7_mask(x))
-                x = self.mask_fcn_logits(x)
-            
-            # Ensure output matches target mask_size
-            if x.shape[-1] != self.mask_size:
-                x = F.interpolate(x, size=(self.mask_size, self.mask_size), 
-                                 mode='bilinear', align_corners=False)
-            return x
-    
-    # Load base Mask R-CNN model
-    model = maskrcnn_resnet50_fpn(weights=None)
-    
-    # Replace box predictor head
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    
-    # Replace mask predictor with custom high-res version
-    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-    hidden_layer = 256
-    model.roi_heads.mask_predictor = HighResMaskRCNNPredictor(
-        in_features_mask, hidden_layer, num_classes, mask_size=mask_resolution
-    )
-
-    # Load trained weights
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
-    
-    model.to(device)
-    model.eval()
-    
-    print(f"✓ Mask R-CNN model loaded successfully")
-    print(f"  - Number of classes: {num_classes}")
-    print(f"  - Mask resolution: {mask_size}x{mask_size}")
-    print(f"  - Device: {device}")
-    
-    return model
-
 
 
 def run_maskrcnn_inference(model, image_rgb, detection_threshold, img_size=2048):
@@ -418,6 +285,17 @@ def process_all_images(maskrcnn_model, class_names, input_folder,
         print(f"  - {class_name}: {count} instances")
 
 
+def update_global_variables(args):
+    """Update global variables with command-line arguments."""
+    global DETECTION_THRESHOLD, MASK_RESOLUTION, MIN_MASK_AREA, TOL, THRESHOLD
+    
+    DETECTION_THRESHOLD = args.detection_threshold
+    MASK_RESOLUTION = args.mask_resolution
+    MIN_MASK_AREA = args.min_mask_area
+    TOL = args.polygon_tolerance
+    THRESHOLD = args.maskrcnn_mask_threshold
+
+
 def main():
     """Main inference function."""
     parser = argparse.ArgumentParser(
@@ -439,20 +317,21 @@ def main():
                         help='Mask resolution (28, 56, or 112)')
     parser.add_argument('--class_names', type=str, required=True,
                         help='JSON dict of class_id: class_name')
+    parser.add_argument('--min_mask_area', type=int, default=MIN_MASK_AREA,
+                        help='Minimum mask area in pixels')
+    parser.add_argument('--polygon_tolerance', type=int, default=TOL,
+                        help='Polygon simplification tolerance')
+    parser.add_argument('--maskrcnn_mask_threshold', type=float, default=THRESHOLD,
+                        help='Threshold to consider pixel as mask (0-1) for Mask R-CNN masks')
     
     args = parser.parse_args()
     
+    # Update global variables using the function
+    update_global_variables(args)
+
     # Parse class names
     class_names = json.loads(args.class_names)
     class_names = {int(k): v for k, v in class_names.items()}
-    
-    # Set global threshold
-    global DETECTION_THRESHOLD
-    DETECTION_THRESHOLD = args.detection_threshold
-    
-    # Set global mask resolution
-    global MASK_RESOLUTION
-    MASK_RESOLUTION = args.mask_resolution
 
     print("="*80)
     print("STANDALONE MASK R-CNN INFERENCE")
@@ -461,15 +340,21 @@ def main():
     print(f"Mask R-CNN IMG_SIZE: {args.maskrcnn_img_size}")
     print(f"Mask Resolution: {MASK_RESOLUTION}")
     print(f"Detection threshold: {args.detection_threshold}")
+    print(f"Min mask area: {MIN_MASK_AREA}")
+    print(f"Polygon tolerance: {TOL}")  
+    print(f"Mask threshold: {THRESHOLD}")
     print(f"Input folder: {args.input_folder}")
     print(f"Output labels: {args.output_labels}")
     print(f"Output images: {args.output_images}")
     print("="*80)
     
     # Load Mask R-CNN model
-    num_classes = len(class_names)
+    num_classes = len(class_names) + 1  # Including background
     maskrcnn_model = load_maskrcnn_model(
-        args.maskrcnn_model, num_classes, MASK_RESOLUTION, DEVICE
+        args.maskrcnn_model, 
+        num_classes=num_classes,
+        mask_resolution=MASK_RESOLUTION,
+        device=DEVICE
     )
     
     # Process all images
