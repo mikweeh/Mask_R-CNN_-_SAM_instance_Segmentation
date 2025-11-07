@@ -66,9 +66,9 @@ TRAIN_IMAGES_PATH = os.path.join(DATASET_PATH, "train")
 VAL_IMAGES_PATH = os.path.join(DATASET_PATH, "valid")
 TEST_IMAGES_PATH = os.path.join(DATASET_PATH, "test")
 TRAIN_ANNOTATIONS = os.path.join(TRAIN_IMAGES_PATH, 
-                                "_annotations_filtered.coco.json")
+                                "_annotations.coco.json")
 VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH, 
-                              "_annotations_filtered.coco.json")
+                              "_annotations.coco.json")
 
 # Training parameters
 NUM_CLASSES = 3
@@ -250,9 +250,9 @@ def update_global_variables(args):
     VAL_IMAGES_PATH = os.path.join(DATASET_PATH, "valid")
     TEST_IMAGES_PATH = os.path.join(DATASET_PATH, "test")
     TRAIN_ANNOTATIONS = os.path.join(TRAIN_IMAGES_PATH, 
-                                    "_annotations_filtered.coco.json")
+                                    "_annotations.coco.json")
     VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH, 
-                                  "_annotations_filtered.coco.json")
+                                "_annotations.coco.json")
     TEMP_FIGURES_PATH = os.path.join(REPORT_OUTPUT_PATH, "imgs")
     
     # Update class configuration ONLY if provided as arguments

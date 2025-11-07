@@ -1,28 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-This script filters the main COCO annotation file for a SINGLE target
-class (for SAM2 binary segmentation training).
+Filter COCO dataset - Creates multiple annotation files in the same folder.
 
-Modified from original to support single-class filtering for SAM2.
-
-
- The dataset folder structure is expected to be:
-
- dataset/
-   train/               # Folder containing training images
-   valid/               # Folder containing validation images
-   test/                # Folder containing test images
-   original_coco/       # Folder containing the original COCO annotation file and original images
-   original_yolo/       # (Not used in this script)
-   train.txt            # Text file listing image filenames for training
-   valid.txt            # Text file listing image filenames for validation
-   test.txt             # Text file listing image filenames for test
-
- The text files can contain filenames with or without extensions, with or without
- quotes, commas, and comments starting with '#'. The script will parse these files
- to extract clean lists of image filename prefixes.
+Structure:
+dataset/
+├── train/
+│   ├── images...
+│   ├── _annotations.coco.json          # Multi-class (for Mask R-CNN)
+│   ├── _annotations_class0.coco.json   # Class 0 only (for SAM2)
+│   └── _annotations_class1.coco.json   # Class 1 only (for SAM2)
+├── valid/  # Same structure
+└── test/   # Same structure
 """
 
 import argparse
@@ -31,66 +20,41 @@ import os
 import shutil
 from typing import Dict, List, Set
 
-# =============================================================================
-# DEFAULT GLOBAL CONFIGURATION VARIABLES
-# =============================================================================
+# Default classes
+CLASSES_TO_KEEP = ['Chromis chromis', 'Coris julis']
 
-# Default class configuration - can be overridden by arguments from main.py
-CLASSES_TO_KEEP = [
-    'Chromis chromis',
-    'Coris julis',
-]
-
-# New parameter for single-class filtering
-TARGET_CLASS_INDEX = 0  # Which class to filter (0 or 1)
-
-# =============================================================================
-# Functions
-# =============================================================================
 
 def load_image_list_from_txt(file_path: str) -> List[str]:
-    """
-    Loads a list of image filename prefixes from a text file.
-    Ignores comments and empty lines. Strips quotes, commas, whitespace,
-    and common image extensions to ensure proper prefix matching.
-    """
+    """Load image filename prefixes from text file."""
     image_list = []
-    # Common image extensions to remove
-    image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif',
-                        '.webp', '.gif')
+    image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', 
+                       '.webp', '.gif')
     
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
-                # Strip whitespace first
                 line = line.strip()
-                
-                # Skip empty lines and comments
                 if not line or line.startswith('#'):
                     continue
                 
-                # Remove trailing commas
                 while line.endswith(','):
                     line = line[:-1].strip()
                 
-                # Remove surrounding quotes
-                while ((line.startswith('"') and line.endswith('"')) or
+                while ((line.startswith('"') and line.endswith('"')) or 
                        (line.startswith("'") and line.endswith("'"))):
                     line = line[1:-1].strip()
                 
-                # Remove common image extensions (case insensitive)
                 line_lower = line.lower()
                 for ext in image_extensions:
                     if line_lower.endswith(ext):
                         line = line[:-len(ext)]
                         break
                 
-                # Add the cleaned filename if it's not empty
                 if line:
                     image_list.append(line)
                     
     except FileNotFoundError:
-        print(f"WARNING: File {file_path} not found. Returning empty list.")
+        print(f"WARNING: File {file_path} not found.")
     except Exception as e:
         print(f"ERROR: Could not read file {file_path}: {e}")
     
@@ -98,98 +62,64 @@ def load_image_list_from_txt(file_path: str) -> List[str]:
 
 
 def find_coco_annotation_file(original_coco_dir: str) -> str:
-    """
-    Finds the unique JSON annotation file in the original_coco directory.
-    
-    Args:
-        original_coco_dir: Path to the original_coco directory
-    
-    Returns:
-        Full path to the annotation file
-    
-    Raises:
-        FileNotFoundError: If no JSON file or multiple JSON files are found
-    """
-    json_files = [f for f in os.listdir(original_coco_dir)
+    """Find unique JSON annotation file in directory."""
+    json_files = [f for f in os.listdir(original_coco_dir) 
                   if f.endswith('.json')]
     
     if len(json_files) == 0:
-        raise FileNotFoundError(f"No JSON annotation file found in "
-                                f"{original_coco_dir}")
+        raise FileNotFoundError(f"No JSON file in {original_coco_dir}")
     elif len(json_files) > 1:
-        raise FileNotFoundError(f"Multiple JSON files found in "
-                                f"{original_coco_dir}. Expected only one: "
-                                f"{json_files}")
+        raise FileNotFoundError(f"Multiple JSON files in {original_coco_dir}: {json_files}")
     
     return os.path.join(original_coco_dir, json_files[0])
 
 
 def create_list_file_if_missing(txt_path: str, images_dir: str) -> None:
-    """
-    Create a text file listing image filenames with a trailing comma if
-    missing.
-    
-    Args:
-        txt_path: Path to the .txt file to create
-        images_dir: Directory containing the image files to list
-    """
+    """Create text file listing images if missing."""
     if not os.path.exists(txt_path):
-        print(f"Creating missing file: {txt_path}")
-        
-        # List image files in images_dir
+        print(f"Creating {txt_path}")
         try:
             files = os.listdir(images_dir)
         except FileNotFoundError:
-            print(f"WARNING: Directory {images_dir} not found, "
-                  f"cannot create {txt_path}")
+            print(f"WARNING: Directory {images_dir} not found")
             return
         
-        # Filter to common image extensions
-        image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff',
-                            '.tif', '.webp', '.gif')
-        image_files = [f for f in files
-                       if f.lower().endswith(image_extensions)]
+        image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', 
+                          '.tif', '.webp', '.gif')
+        image_files = [f for f in files 
+                      if f.lower().endswith(image_extensions)]
         
-        # Write filenames (with extension) one per line ending with a comma
         with open(txt_path, 'w', encoding='utf-8') as f:
             for filename in sorted(image_files):
                 f.write(filename + ',\n')
         
-        print(f"Created {txt_path} with {len(image_files)} image filenames "
-              f"from {images_dir}")
-    else:
-        print(f"File {txt_path} already exists, skipping creation.")
+        print(f"Created {txt_path} with {len(image_files)} images")
 
 
-def filter_coco_dataset(images_to_keep: List[str],
-                        new_annotation_file: str,
-                        dataset_name: str,
-                        original_annotation_file: str,
-                        target_class_name: str) -> None:
+def filter_coco_annotations(images_to_keep: List[str], output_file: str,
+                           dataset_name: str, original_annotation_file: str,
+                           target_classes: List[str], class_filter_mode: str = 'multi'):
     """
-    Filters a COCO dataset to keep only specified images and ONE target
-    class for SAM2 binary segmentation.
-    Also copies the corresponding image files to the output directory.
+    Filter COCO annotations.
     
     Args:
-        images_to_keep: List of image filename prefixes to keep
-        new_annotation_file: Path where to save the filtered annotation file
-        dataset_name: Name of the dataset (train/valid/test) for logging
-        original_annotation_file: Path to the original annotation file
-        target_class_name: Single class name to keep (binary segmentation)
+        images_to_keep: List of image filename prefixes
+        output_file: Where to save filtered annotations
+        dataset_name: Dataset name (train/valid/test)
+        original_annotation_file: Original COCO annotations
+        target_classes: List of class names to keep
+        class_filter_mode: 'multi' for all classes, 'class0', 'class1', etc. for single class
     """
-    print(f"\n=== Processing {dataset_name.upper()} dataset ===")
-    print(f"Target class for binary segmentation: {target_class_name}")
-    print(f"Loading original annotations from: {original_annotation_file}")
+    print(f"\n=== Processing {dataset_name.upper()} - {class_filter_mode} ===")
+    print(f"Loading: {original_annotation_file}")
     
     try:
         with open(original_annotation_file, 'r') as f:
             coco_data = json.load(f)
     except FileNotFoundError:
-        print(f"ERROR: The file {original_annotation_file} was not found.")
+        print(f"ERROR: File not found: {original_annotation_file}")
         return
-    
-    # Create a new dictionary to hold the filtered data.
+
     filtered_coco = {
         'info': coco_data.get('info', {}),
         'licenses': coco_data.get('licenses', []),
@@ -197,134 +127,128 @@ def filter_coco_dataset(images_to_keep: List[str],
         'annotations': [],
         'categories': []
     }
-    
-    # 1. Find the target category and its ID (only ONE class for SAM2)
-    target_category_id = None
+
+    # Determine which classes to include
+    if class_filter_mode == 'multi':
+        classes_to_include = target_classes
+    else:
+        # Extract class index from mode (e.g., 'class0' -> 0)
+        class_idx = int(class_filter_mode.replace('class', ''))
+        if class_idx < len(target_classes):
+            classes_to_include = [target_classes[class_idx]]
+        else:
+            print(f"ERROR: Invalid class index {class_idx}")
+            return
+
+    # Find target categories
+    target_category_ids: Set[int] = set()
+    category_id_mapping: Dict[int, int] = {}
     original_categories = coco_data.get('categories', [])
     
+    new_category_id = 1
     for category in original_categories:
-        if category['name'] == target_class_name:
-            target_category_id = category['id']
-            # For SAM2, we use category ID = 1 (binary: target vs background)
+        if category['name'] in classes_to_include:
+            original_id = category['id']
+            target_category_ids.add(original_id)
+            category_id_mapping[original_id] = new_category_id
+            
             filtered_coco['categories'].append({
-                'id': 1,
+                'id': new_category_id,
                 'name': category['name'],
                 'supercategory': category.get('supercategory', '')
             })
-            break
-    
-    if target_category_id is None:
-        print(f"ERROR: Target class '{target_class_name}' not found in "
-              f"the original categories.")
+            new_category_id += 1
+
+    if not target_category_ids:
+        print(f"ERROR: No classes found: {classes_to_include}")
         return
-    
-    print(f"Found target class: {target_class_name} "
-          f"(original ID: {target_category_id})")
-    
-    # 2. Get the image IDs for the specified filenames.
+
+    print(f"Found {len(target_category_ids)} classes: "
+          f"{[cat['name'] for cat in filtered_coco['categories']]}")
+
+    # Get image IDs for specified filenames
     image_ids_to_keep: Set[int] = set()
     for image_info in coco_data.get('images', []):
-        if any(image_info['file_name'].startswith(prefix)
-               for prefix in images_to_keep):
+        if any(image_info['file_name'].startswith(prefix) for prefix in images_to_keep):
             image_ids_to_keep.add(image_info['id'])
     
     if not image_ids_to_keep:
-        print(f"WARNING: None of the specified images were found in the "
-              f"annotation file for {dataset_name} dataset.")
+        print(f"WARNING: No images found for {dataset_name}")
     else:
-        print(f"Found {len(image_ids_to_keep)} of the specified images to "
-              f"process for {dataset_name} dataset.")
-    
-    # 3. Filter annotations for target class only (SAM2 binary segmentation)
-    kept_image_ids_from_annotations: Set[int] = set()
+        print(f"Found {len(image_ids_to_keep)} images")
+
+    # Filter annotations
+    kept_image_ids: Set[int] = set()
     for annotation in coco_data.get('annotations', []):
-        # Check if annotation belongs to target images AND target class
-        if (annotation['image_id'] in image_ids_to_keep and
-                annotation['category_id'] == target_category_id):
-            # Set category ID to 1 for SAM2 binary segmentation
-            annotation['category_id'] = 1
+        if (annotation['image_id'] in image_ids_to_keep and 
+            annotation['category_id'] in target_category_ids):
+            annotation['category_id'] = category_id_mapping[annotation['category_id']]
             filtered_coco['annotations'].append(annotation)
-            kept_image_ids_from_annotations.add(annotation['image_id'])
-    
-    print(f"Filtered to {len(filtered_coco['annotations'])} annotations "
-          f"for class '{target_class_name}' in {dataset_name} dataset.")
-    
-    # 4. Filter the images list to include only those that have annotations.
+            kept_image_ids.add(annotation['image_id'])
+
+    print(f"Filtered to {len(filtered_coco['annotations'])} annotations")
+
+    # Filter images list
     for image_info in coco_data.get('images', []):
-        if image_info['id'] in kept_image_ids_from_annotations:
+        if image_info['id'] in kept_image_ids:
             filtered_coco['images'].append(image_info)
     
-    print(f"Final {dataset_name} dataset contains "
-          f"{len(filtered_coco['images'])} images with relevant "
-          f"annotations.")
-    
-    # 5. Save the new filtered annotation file.
-    print(f"Saving filtered annotations to: {new_annotation_file}")
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(new_annotation_file), exist_ok=True)
-    
-    with open(new_annotation_file, 'w') as f:
+    print(f"Final: {len(filtered_coco['images'])} images with annotations")
+
+    # Save
+    print(f"Saving to: {output_file}")
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w') as f:
         json.dump(filtered_coco, f, indent=4)
     
-    # 6. Copy image files to output directory
-    print(f"Copying image files for {dataset_name} dataset...")
-    original_images_dir = os.path.dirname(original_annotation_file)
-    output_dir = os.path.dirname(new_annotation_file)
+    print(f"=== {dataset_name.upper()} - {class_filter_mode} complete ===")
+
+
+def copy_images_to_folder(images_to_keep: List[str], original_images_dir: str,
+                         output_dir: str):
+    """Copy images to output folder."""
+    print(f"\nCopying images to {output_dir}...")
+    os.makedirs(output_dir, exist_ok=True)
     
     copied_files = []
-    for image_prefix in images_to_keep:
-        # Find files that start with the given prefix
-        try:
+    try:
+        for image_prefix in images_to_keep:
             for file_name in os.listdir(original_images_dir):
                 if file_name.startswith(image_prefix):
                     src_path = os.path.join(original_images_dir, file_name)
                     dst_path = os.path.join(output_dir, file_name)
-                    shutil.copy2(src_path, dst_path)
-                    copied_files.append(file_name)
-                    break  # Only copy the first matching file for each prefix
-        except FileNotFoundError:
-            print(f"WARNING: Could not access directory "
-                  f"{original_images_dir}")
-            break
+                    if not os.path.exists(dst_path):
+                        shutil.copy2(src_path, dst_path)
+                        copied_files.append(file_name)
+                    break
+    except FileNotFoundError:
+        print(f"WARNING: Could not access {original_images_dir}")
     
-    print(f"Copied {len(copied_files)} images to {output_dir}")
-    print(f"=== {dataset_name.upper()} dataset processing complete! ===")
+    print(f"Copied {len(copied_files)} images")
 
 
 def main() -> None:
-    """
-    Main function that processes all three datasets (train, valid, test)
-    for a SINGLE target class (SAM2 binary segmentation).
-    """
-    # Set up command-line argument parsing
+    """Main function."""
     parser = argparse.ArgumentParser(
-        description='Filter COCO dataset for single class '
-                    '(SAM2 binary segmentation)'
+        description='Filter COCO dataset - creates multiple annotation files'
     )
     
     parser.add_argument(
         'dataset_path',
         nargs='?',
         default='./dataset',
-        help='Path to the dataset directory (default: ./dataset)'
+        help='Path to dataset directory'
     )
     
-    # Add classes_to_keep argument
     parser.add_argument('--classes_to_keep', type=str, default=None,
-                        help='JSON string with list of class names')
-    
-    # Add target_class_index argument for single-class filtering
-    parser.add_argument('--target_class_index', type=int, default=0,
-                        help='Index of target class to filter (0 or 1)')
+                       help='JSON list of class names')
     
     args = parser.parse_args()
     dataset_path = args.dataset_path
-    
-    print(f"Using dataset path: {dataset_path}")
-    
-    # Create train.txt, valid.txt, test.txt if missing
-    print("Checking for missing .txt files and creating if necessary...")
+    print(f"Dataset path: {dataset_path}")
+
+    # Create .txt files if missing
+    print("Checking for .txt files...")
     create_list_file_if_missing(
         os.path.join(dataset_path, 'train.txt'),
         os.path.join(dataset_path, 'original_coco', 'train')
@@ -337,107 +261,77 @@ def main() -> None:
         os.path.join(dataset_path, 'test.txt'),
         os.path.join(dataset_path, 'original_coco', 'test')
     )
-    
-    # Update CLASSES_TO_KEEP from arguments if provided
-    global CLASSES_TO_KEEP, TARGET_CLASS_INDEX
+
+    # Update classes
+    global CLASSES_TO_KEEP
     if args.classes_to_keep is not None:
         CLASSES_TO_KEEP = json.loads(args.classes_to_keep)
     
-    TARGET_CLASS_INDEX = args.target_class_index
+    print(f"\nTarget classes: {CLASSES_TO_KEEP}")
     
-    # Select the single target class for this run
-    if TARGET_CLASS_INDEX >= len(CLASSES_TO_KEEP):
-        print(f"ERROR: target_class_index {TARGET_CLASS_INDEX} is out of "
-              f"range. Available classes: {CLASSES_TO_KEEP}")
-        return
-    
-    target_class_name = CLASSES_TO_KEEP[TARGET_CLASS_INDEX]
-    print(f"\n{'='*60}")
-    print(f"FILTERING FOR SINGLE CLASS: {target_class_name}")
-    print(f"Class index: {TARGET_CLASS_INDEX}")
-    print(f"{'='*60}\n")
-    
-    # --- Input Files
+    # Find annotation files
     original_coco_dir = os.path.join(dataset_path, 'original_coco')
     
-    # Define paths for each split's annotation file
-    train_coco_dir = os.path.join(original_coco_dir, 'train')
-    valid_coco_dir = os.path.join(original_coco_dir, 'valid')
-    test_coco_dir = os.path.join(original_coco_dir, 'test')
-    
-    # Find annotation files for each split
     try:
-        train_annotation_file = find_coco_annotation_file(train_coco_dir)
-        print(f"Found train annotation file: {train_annotation_file}")
+        train_annotation = find_coco_annotation_file(os.path.join(original_coco_dir, 'train'))
+        valid_annotation = find_coco_annotation_file(os.path.join(original_coco_dir, 'valid'))
+        test_annotation = find_coco_annotation_file(os.path.join(original_coco_dir, 'test'))
     except FileNotFoundError as e:
-        print(f"ERROR: Could not find train annotation file: {e}")
+        print(f"ERROR: {e}")
         return
+
+    # Load image lists
+    images_train = load_image_list_from_txt(os.path.join(dataset_path, 'train.txt'))
+    images_valid = load_image_list_from_txt(os.path.join(dataset_path, 'valid.txt'))
+    images_test = load_image_list_from_txt(os.path.join(dataset_path, 'test.txt'))
     
-    try:
-        valid_annotation_file = find_coco_annotation_file(valid_coco_dir)
-        print(f"Found valid annotation file: {valid_annotation_file}")
-    except FileNotFoundError as e:
-        print(f"ERROR: Could not find valid annotation file: {e}")
-        return
+    print("\nStarting dataset filtering...")
     
-    try:
-        test_annotation_file = find_coco_annotation_file(test_coco_dir)
-        print(f"Found test annotation file: {test_annotation_file}")
-    except FileNotFoundError as e:
-        print(f"ERROR: Could not find test annotation file: {e}")
-        return
+    # Process each split
+    for split_name, images_list, original_ann, original_img_dir in [
+        ('train', images_train, train_annotation, os.path.join(original_coco_dir, 'train')),
+        ('valid', images_valid, valid_annotation, os.path.join(original_coco_dir, 'valid')),
+        ('test', images_test, test_annotation, os.path.join(original_coco_dir, 'test'))
+    ]:
+        output_dir = os.path.join(dataset_path, split_name)
+        
+        # Copy images (only once)
+        copy_images_to_folder(images_list, original_img_dir, output_dir)
+        
+        # Create multi-class annotation (for Mask R-CNN)
+        filter_coco_annotations(
+            images_list,
+            os.path.join(output_dir, '_annotations.coco.json'),
+            split_name,
+            original_ann,
+            CLASSES_TO_KEEP,
+            class_filter_mode='multi'
+        )
+        
+        # Create single-class annotations (for SAM2)
+        for class_idx in range(len(CLASSES_TO_KEEP)):
+            filter_coco_annotations(
+                images_list,
+                os.path.join(output_dir, f'_annotations_class{class_idx}.coco.json'),
+                split_name,
+                original_ann,
+                CLASSES_TO_KEEP,
+                class_filter_mode=f'class{class_idx}'
+            )
     
-    # --- Output Files ---
-    # Paths where the new filtered annotation files will be saved.
-    new_annotation_file_train = os.path.join(
-        dataset_path, 'train', '_annotations_filtered.coco.json'
-    )
-    new_annotation_file_valid = os.path.join(
-        dataset_path, 'valid', '_annotations_filtered.coco.json'
-    )
-    new_annotation_file_test = os.path.join(
-        dataset_path, 'test', '_annotations_filtered.coco.json'
-    )
-    
-    # --- Filtering Criteria ---
-    # Load image filename prefixes from text files
-    images_to_keep_train = load_image_list_from_txt(
-        os.path.join(dataset_path, 'train.txt')
-    )
-    images_to_keep_valid = load_image_list_from_txt(
-        os.path.join(dataset_path, 'valid.txt')
-    )
-    images_to_keep_test = load_image_list_from_txt(
-        os.path.join(dataset_path, 'test.txt')
-    )
-    
-    print("Starting COCO dataset filtering for single class...")
-    
-    # Process train dataset with single target class
-    filter_coco_dataset(images_to_keep_train, new_annotation_file_train,
-                        "train", train_annotation_file, target_class_name)
-    
-    # Process validation dataset with single target class
-    filter_coco_dataset(images_to_keep_valid, new_annotation_file_valid,
-                        "valid", valid_annotation_file, target_class_name)
-    
-    # Process test dataset with single target class
-    filter_coco_dataset(images_to_keep_test, new_annotation_file_test,
-                        "test", test_annotation_file, target_class_name)
-    
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print("ALL DATASETS PROCESSED SUCCESSFULLY!")
-    print(f"Filtered for class: {target_class_name} (index "
-          f"{TARGET_CLASS_INDEX})")
-    print("Created directories:")
-    print(f"  - {dataset_path}/train/ with {len(images_to_keep_train)} "
-          f"image prefixes")
-    print(f"  - {dataset_path}/valid/ with {len(images_to_keep_valid)} "
-          f"image prefixes")
-    print(f"  - {dataset_path}/test/ with {len(images_to_keep_test)} "
-          f"image prefixes")
-    print("="*60)
+    print(f"Created directories with multiple annotation files:")
+    print(f" - {dataset_path}/train/")
+    print(f" - {dataset_path}/valid/")
+    print(f" - {dataset_path}/test/")
+    print("\nEach folder contains:")
+    print(f" - _annotations.coco.json (multi-class for Mask R-CNN)")
+    for i in range(len(CLASSES_TO_KEEP)):
+        print(f" - _annotations_class{i}.coco.json (class {i} for SAM2)")
+    print("="*80)
 
 
 if __name__ == '__main__':
     main()
+

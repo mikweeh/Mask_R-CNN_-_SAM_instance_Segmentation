@@ -85,10 +85,8 @@ SAM2_MODEL_ID = "facebook/sam2-hiera-large"
 DATASET_PATH = "dataset"
 TRAIN_IMAGES_PATH = os.path.join(DATASET_PATH, "train")
 VAL_IMAGES_PATH = os.path.join(DATASET_PATH, "valid")
-TRAIN_ANNOTATIONS = os.path.join(TRAIN_IMAGES_PATH,
-                                  "_annotations_filtered.coco.json")
-VAL_ANNOTATIONS = os.path.join(VAL_IMAGES_PATH,
-                                "_annotations_filtered.coco.json")
+TRAIN_ANNOTATIONS = None
+VAL_ANNOTATIONS = None
 
 # Training parameters
 NUM_CLASSES = 1
@@ -925,24 +923,25 @@ def update_global_variables(args):
     VAL_IMAGES_PATH = os.path.join(DATASET_PATH, "valid")
 
     if TRAIN_UNIFIED:
-        # Use ORIGINAL annotations (all classes)
+        # Use multi-class annotations
         TRAIN_ANNOTATIONS = os.path.join(
-            DATASET_PATH, "original_coco/train/_annotations.coco.json"
+            TRAIN_IMAGES_PATH, "_annotations.coco.json"
         )
         VAL_ANNOTATIONS = os.path.join(
-            DATASET_PATH, "original_coco/valid/_annotations.coco.json"
+            VAL_IMAGES_PATH, "_annotations.coco.json"
         )
-        print("UNIFIED MODE: Using original annotations with ALL classes")
+        print("UNIFIED MODE: Using multi-class annotations")
     else:
-        # Use filtered annotations (single class)
+        # Use single-class annotations
+        class_suffix = f"_class{TARGET_CLASS_INDEX}"
         TRAIN_ANNOTATIONS = os.path.join(
-            TRAIN_IMAGES_PATH, "_annotations_filtered.coco.json"
+            TRAIN_IMAGES_PATH, f"_annotations{class_suffix}.coco.json"
         )
         VAL_ANNOTATIONS = os.path.join(
-            VAL_IMAGES_PATH, "_annotations_filtered.coco.json"
+            VAL_IMAGES_PATH, f"_annotations{class_suffix}.coco.json"
         )
-        print(f"SINGLE CLASS MODE: Using filtered annotations for "
-              f"class {TARGET_CLASS_INDEX}")
+        class_name = CLASS_NAMES.get(TARGET_CLASS_INDEX, f"class{TARGET_CLASS_INDEX}")
+        print(f"SINGLE CLASS MODE: Using annotations for {class_name}")
 
     TEMP_FIGURES_PATH = os.path.join(REPORT_OUTPUT_PATH, "imgs")
     
