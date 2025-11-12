@@ -819,10 +819,7 @@ class PipelineOrchestrator:
             maskrcnn_model = self.config.get('models', 'maskrcnn_model_path')
             verify_model_exists(maskrcnn_model, "Mask R-CNN")
             self.inference_engine.run_maskrcnn_inference()
-        
-        elif inference_mode == InferenceMode.SAM2:
-            self._verify_sam2_models()
-            self.inference_engine.run_sam2_inference()
+
         
         else:  # HYBRID
             maskrcnn_model = self.config.get('models', 'maskrcnn_model_path')

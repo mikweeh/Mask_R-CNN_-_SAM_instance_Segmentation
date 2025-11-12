@@ -9,8 +9,8 @@
 # =============================================================================
 pipeline:
   # Training control
-  train_maskrcnn: true                # Enable/disable Mask R-CNN training
-  train_sam2: true                    # Enable/disable SAM2 training
+  train_maskrcnn: false                # Enable/disable Mask R-CNN training
+  train_sam2: false                    # Enable/disable SAM2 training
   
   # Inference mode: 'maskrcnn' or 'hybrid'
   # - 'maskrcnn': Use Mask R-CNN only for inference
@@ -106,12 +106,12 @@ training_sam2:
 # INFERENCE CONFIGURATION
 # =============================================================================
 inference:
-  # Detection threshold
-  detection_threshold: 0.5
+  # Detection threshold (it affects the mask rcnn model)
+  detection_threshold: 0.2
   
-  # Mask processing
-  mask_threshold: 0.95           # Threshold for SAM2/hybrid masks
-  maskrcnn_mask_threshold: 0.8   # Threshold for Mask R-CNN masks
+  # Mask processing (confidence of the masks)
+  mask_threshold: 0.5           # Threshold for SAM2/hybrid masks
+  maskrcnn_mask_threshold: 0.5   # Threshold for Mask R-CNN masks
   min_mask_area: 100             # Minimum mask area in pixels
   erode_iterations: 0            # Erosion iterations for masks (only SAM)
   

@@ -29,6 +29,7 @@ except ImportError:
 
 # Import shared model loader
 from maskrcnn_loader import load_maskrcnn_model
+from visualization_utils import create_detection_visualization
 
 # =============================================================================
 # CONFIGURATION - NOW ALL FROM ARGUMENTS (no hardcoded defaults)
@@ -122,20 +123,33 @@ def load_sam2_models(model_paths, model_id, device):
     
     return predictors
 
-
 def process_image_hybrid(image_path, maskrcnn_model, sam2_predictors, 
                         class_names, maskrcnn_img_size=2048,
                         detection_threshold=0.5, min_mask_area=100,
                         mask_threshold=0.99, erode_iterations=2):
     """Process single image with hybrid Mask R-CNN + SAM2."""
-    # Load and preprocess image
+    # Load image
     image = cv2.imread(image_path)
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     orig_h, orig_w = image_rgb.shape[:2]
     
-    # Resize for Mask R-CNN
-    image_resized = cv2.resize(image_rgb, (maskrcnn_img_size, maskrcnn_img_size))
-    image_tensor = torch.from_numpy(image_resized).permute(2, 0, 1).float() / 255.0
+    # Use same preprocessing as Mask R-CNN inference (with padding)
+    # Resize maintaining aspect ratio
+    scale = maskrcnn_img_size / max(orig_h, orig_w)
+    new_h, new_w = int(orig_h * scale), int(orig_w * scale)
+    resized = cv2.resize(image_rgb, (new_w, new_h))
+    
+    # Pad to square
+    pad_h = maskrcnn_img_size - new_h
+    pad_w = maskrcnn_img_size - new_w
+    pad_top = pad_h // 2
+    pad_left = pad_w // 2
+    
+    padded = np.zeros((maskrcnn_img_size, maskrcnn_img_size, 3), dtype=np.uint8)
+    padded[pad_top:pad_top+new_h, pad_left:pad_left+new_w] = resized
+    
+    # Convert to tensor
+    image_tensor = torch.from_numpy(padded).permute(2, 0, 1).float() / 255.0
     image_tensor = image_tensor.unsqueeze(0).to(DEVICE)
     
     # Mask R-CNN inference
@@ -146,29 +160,43 @@ def process_image_hybrid(image_path, maskrcnn_model, sam2_predictors,
     keep_indices = outputs['scores'] > detection_threshold
     boxes = outputs['boxes'][keep_indices].cpu().numpy()
     labels = outputs['labels'][keep_indices].cpu().numpy()
-    scores = outputs['scores'][keep_indices].cpu().numpy()
     
     yolo_annotations = []
+    detections_for_viz = []
     
     # Process each detection by class
-    for class_idx in sorted(sam2_predictors.keys()):
-        class_detections = labels == class_idx
+    for yolo_class_idx in sorted(sam2_predictors.keys()):
+        # Convert YOLO class index to Mask R-CNN label
+        maskrcnn_label = yolo_class_idx + 1
+        class_detections = labels == maskrcnn_label
+        
         if not class_detections.any():
             continue
         
-        class_boxes = boxes[class_detections]
-        sam2_predictor = sam2_predictors[class_idx]
+        class_name = class_names[yolo_class_idx]
+        print(f"  Processing {class_detections.sum()} detections for "
+              f"class {yolo_class_idx} ({class_name})")
         
-        # Set image for SAM2
+        class_boxes = boxes[class_detections]
+        sam2_predictor = sam2_predictors[yolo_class_idx]
+        
+        # Set image for SAM2 (use original unpadded image)
         sam2_predictor.set_image(image_rgb)
         
         for bbox in class_boxes:
-            # Scale bbox back to original size
+            # Transform bbox from padded coordinates to original coordinates
+            # Remove padding
             x1, y1, x2, y2 = bbox
-            x1 = int(x1 * orig_w / maskrcnn_img_size)
-            y1 = int(y1 * orig_h / maskrcnn_img_size)
-            x2 = int(x2 * orig_w / maskrcnn_img_size)
-            y2 = int(y2 * orig_h / maskrcnn_img_size)
+            x1 = max(0, x1 - pad_left)
+            y1 = max(0, y1 - pad_top)
+            x2 = max(0, x2 - pad_left)
+            y2 = max(0, y2 - pad_top)
+            
+            # Scale back to original size
+            x1 = int(x1 / scale)
+            y1 = int(y1 / scale)
+            x2 = int(x2 / scale)
+            y2 = int(y2 / scale)
             
             # Clip to image boundaries
             x1, y1 = max(0, x1), max(0, y1)
@@ -184,7 +212,8 @@ def process_image_hybrid(image_path, maskrcnn_model, sam2_predictors,
                 multimask_output=False
             )
             
-            refined_mask = masks[0].astype(np.uint8)
+            # Apply mask threshold
+            refined_mask = (masks[0] > mask_threshold).astype(np.uint8)
             
             # Apply erosion if specified
             if erode_iterations > 0:
@@ -197,43 +226,20 @@ def process_image_hybrid(image_path, maskrcnn_model, sam2_predictors,
                 continue
             
             # Convert to YOLO format
-            yolo_line = mask_to_yolo_polygon(refined_mask, class_idx, 
-                                            tolerance=TOL)
+            yolo_line = mask_to_yolo_polygon(refined_mask, yolo_class_idx, 
+                                             tolerance=TOL)
             
             if yolo_line is not None:
                 yolo_annotations.append(yolo_line)
-    
-    return yolo_annotations, image_rgb
 
+                # Store for visualization
+                detections_for_viz.append({
+                    'mask': refined_mask,
+                    'class': yolo_class_idx
+                })
+    
+    return yolo_annotations, image_rgb, detections_for_viz
 
-def create_visualization(image_rgb, yolo_annotations, output_path, class_names):
-    """Create visualization of detections."""
-    image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    
-    # Colors for each class
-    colors = {
-        0: (0, 255, 0),    # Green for Chromis
-        1: (255, 0, 0)     # Blue for Coris
-    }
-    
-    for ann in yolo_annotations:
-        parts = ann.split()
-        class_id = int(parts[0])
-        coords = [float(x) for x in parts[1:]]
-        
-        # Convert normalized coords to pixels
-        h, w = image.shape[:2]
-        points = []
-        for i in range(0, len(coords), 2):
-            x = int(coords[i] * w)
-            y = int(coords[i+1] * h)
-            points.append([x, y])
-        
-        # Draw polygon
-        points = np.array(points, dtype=np.int32)
-        cv2.polylines(image, [points], True, colors.get(class_id, (0, 255, 255)), 2)
-    
-    cv2.imwrite(output_path, image)
 
 def update_global_variables(args, sam2_model_paths, class_names):
     """Update global variables from parsed arguments."""
@@ -350,7 +356,7 @@ def main():
         image_path = os.path.join(args.input_folder, img_file)
         
         # Process image
-        yolo_annotations, image_rgb = process_image_hybrid(
+        yolo_annotations, image_rgb, detections = process_image_hybrid(
             image_path, maskrcnn_model, sam2_predictors, class_names,
             maskrcnn_img_size=args.maskrcnn_img_size,
             detection_threshold=args.detection_threshold,
@@ -367,7 +373,12 @@ def main():
         
         # Save visualization
         viz_path = os.path.join(args.output_images, f"{basename}.jpg")
-        create_visualization(image_rgb, yolo_annotations, viz_path, class_names)
+        create_detection_visualization(
+            image_rgb, detections, class_names, viz_path,
+            mode='outline',
+            line_thickness=1,
+            min_mask_area=10
+        )
         
         print(f"  Saved {len(yolo_annotations)} annotations")
     

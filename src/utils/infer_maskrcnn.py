@@ -14,6 +14,7 @@ import json
 
 # Import shared model loader
 from maskrcnn_loader import load_maskrcnn_model
+from visualization_utils import create_detection_visualization
 
 # Configuration
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -153,48 +154,88 @@ def mask_to_yolo_segmentation(mask, class_id, img_height, img_width, tolerance=0
         return None
 
 
-def save_visualization_image(image_rgb, detections, class_names, output_path, alpha=0.4):
+def save_visualization_image(image_rgb, detections, class_names, output_path, 
+                            alpha=0.4, draw_filled=False, line_thickness=1):
     """
-    Create and save visualization with overlaid masks.
+    Create and save visualization with polygon outlines or filled masks.
     
     Args:
         image_rgb: Original image in RGB format
         detections: List of detection dictionaries
         class_names: Dict mapping class_id to class_name
         output_path: Where to save visualization
-        alpha: Transparency of overlay
+        alpha: Transparency of overlay (only used if draw_filled=True)
+        draw_filled: If True, draw filled masks; if False, draw polygon outlines
+        line_thickness: Thickness of polygon lines (default: 2)
     """
     result_image = cv2.cvtColor(image_rgb.copy(), cv2.COLOR_RGB2BGR)
     
     # Define colors for different classes (BGR format)
     class_colors = {
-        0: (0, 255, 0),    # Green
-        1: (255, 0, 0),    # Blue
-        2: (0, 0, 255)     # Red
+        0: (0, 255, 0),    # Green for class 0
+        1: (255, 0, 0),    # Blue for class 1
+        2: (0, 0, 255)     # Red for class 2
     }
     
     for det in detections:
         mask = det['mask']
         class_id = det['class']
         
+        # Binarize mask
         binary_mask = (mask > THRESHOLD).astype(np.uint8)
-        
         if not np.any(binary_mask):
             continue
         
+        # Get color for this class
         color = class_colors.get(class_id, (255, 255, 255))
         
-        # Create colored mask overlay
-        colored_mask = np.zeros_like(result_image)
-        colored_mask[binary_mask == 1] = color
-        
-        # Apply transparency
-        mask_area = (binary_mask == 1)
-        if np.any(mask_area):
-            result_image[mask_area] = cv2.addWeighted(
-                result_image[mask_area], 1.0 - alpha,
-                colored_mask[mask_area], alpha, 0
+        if draw_filled:
+            # Original behavior: draw filled mask with transparency
+            colored_mask = np.zeros_like(result_image)
+            colored_mask[binary_mask == 1] = color
+            
+            mask_area = binary_mask == 1
+            if np.any(mask_area):
+                result_image[mask_area] = cv2.addWeighted(
+                    result_image[mask_area], 1.0 - alpha,
+                    colored_mask[mask_area], alpha, 0
+                )
+        else:
+            # Draw polygon outlines
+            contours, _ = cv2.findContours(
+                binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
+            
+            if contours:
+                # Draw all contours (main polygon + holes if any)
+                for contour in contours:
+                    if cv2.contourArea(contour) > MIN_MASK_AREA:
+                        # Draw polygon outline
+                        cv2.drawContours(
+                            result_image, [contour], -1, color, 
+                            thickness=line_thickness, lineType=cv2.LINE_AA
+                        )
+                
+                # # Optional: Draw bounding box and label
+                # x, y, w, h = cv2.boundingRect(contours[0])
+                # label = class_names.get(class_id, f"Class {class_id}")
+                
+                # # Draw label background
+                # label_size = cv2.getTextSize(
+                #     label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                # )[0]
+                # cv2.rectangle(
+                #     result_image, 
+                #     (x, y - label_size[1] - 5), 
+                #     (x + label_size[0], y),
+                #     color, -1
+                # )
+                
+                # # Draw label text
+                # cv2.putText(
+                #     result_image, label, (x, y - 5),
+                #     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+                # )
     
     cv2.imwrite(output_path, result_image)
 
@@ -233,46 +274,68 @@ def process_all_images(maskrcnn_model, class_names, input_folder,
         img_path = os.path.join(input_folder, img_file)
         print(f"[{idx}/{len(image_files)}] Processing {img_file}")
         
-        # Load image
-        image = cv2.imread(img_path)
-        if image is None:
-            print(f"  Failed to load, skipping")
+        try:
+            # Load image
+            image = cv2.imread(img_path)
+            if image is None:
+                print(f"  Failed to load, skipping")
+                continue
+            
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image_rgb.shape[:2]
+            
+            # Run Mask R-CNN inference
+            detections = run_maskrcnn_inference(
+                maskrcnn_model, image_rgb, DETECTION_THRESHOLD, 
+                img_size=maskrcnn_img_size
+            )
+            
+            # Remap model classes (shift from 1-indexed to 0-indexed)
+            for det in detections:
+                det['class'] = det['class'] - 1
+            
+            # Convert detections to YOLO format
+            yolo_annotations = []
+            for det in detections:
+                # Ensure class is valid
+                if det['class'] < 0 or det['class'] not in class_names:
+                    print(f"  Warning: Invalid class {det['class']}, skipping")
+                    continue
+                    
+                yolo_str = mask_to_yolo_segmentation(
+                    det['mask'], det['class'], h, w, tolerance=TOL
+                )
+                if yolo_str is not None:
+                    yolo_annotations.append(yolo_str)
+                    class_counts[det['class']] += 1
+                    total_detections += 1
+            
+            # Save label file
+            basename = os.path.splitext(img_file)[0]
+            label_path = os.path.join(output_labels, f"{basename}.txt")
+            with open(label_path, 'w') as f:
+                f.write('\n'.join(yolo_annotations))
+            
+            # Save visualization
+            viz_output_path = os.path.join(output_images, f"{basename}.jpg")
+            create_detection_visualization(
+                image_rgb, detections, class_names, viz_output_path,
+                mode='outline',          # 'outline' or 'filled'
+                line_thickness=1,
+                min_mask_area=10
+            )
+            
+            print(f"  Detected {len(detections)} instances")
+            print(f"  Saved: {basename}.txt ({len(yolo_annotations)} masks)")
+            
+        except Exception as e:
+            print(f"  ERROR processing {img_file}: {e}")
             continue
         
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        h, w = image_rgb.shape[:2]
-        
-        # Run Mask R-CNN inference
-        detections = run_maskrcnn_inference(
-            maskrcnn_model, image_rgb, DETECTION_THRESHOLD, 
-            img_size=maskrcnn_img_size
-        )
-        
-        # Convert detections to YOLO format
-        yolo_annotations = []
-        for det in detections:
-            yolo_str = mask_to_yolo_segmentation(
-                det['mask'], det['class'], h, w, tolerance=TOL
-            )
-            if yolo_str is not None:
-                yolo_annotations.append(yolo_str)
-                class_counts[det['class']] += 1
-                total_detections += 1
-        
-        # Save label file
-        basename = os.path.splitext(img_file)[0]
-        label_path = os.path.join(output_labels, f"{basename}.txt")
-        with open(label_path, 'w') as f:
-            f.write('\n'.join(yolo_annotations))
-        
-        # Save visualization
-        viz_output_path = os.path.join(output_images, f"{basename}.jpg")
-        save_visualization_image(
-            image_rgb, detections, class_names, viz_output_path, alpha=0.4
-        )
-        
-        print(f"  Detected {len(detections)} instances")
-        print(f"  Saved: {basename}.txt ({len(yolo_annotations)} masks)")
+        finally:
+            # Free GPU memory after each image
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     # Summary
     print("="*80)
