@@ -365,44 +365,54 @@ def copy_data_yaml(src_yaml_path, dest_folder):
         return True
     return False
 
-def modify_pixel_rgb(image_path):
+def modify_pixel_block(
+    image_path: str, 
+    block_size: int = 4,
+    position: Tuple[int, int] = (0, 0)
+) -> bool:
     """
-    Modify the RGB value of pixel at position (0,0) to a random value.
+    Modify a block of pixels using vectorized NumPy operations for efficiency.
     
     Args:
         image_path: Path to the image file to modify
-    
+        block_size: Size of the square block to modify (default: 4x4)
+        position: Top-left corner position (x, y) of the block (default: (0, 0))
+        
     Returns:
-        bool: True if pixel was modified successfully, False otherwise
+        bool: True if modification was successful, False otherwise
     """
     try:
-        # Open the image
+        # Load image as NumPy array (vectorized operation)
         image = Image.open(image_path)
-        
-        # Ensure the image is in RGB mode
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Load pixel data
-        pixels = image.load()
+        img_array = np.array(image, dtype=np.uint8)
         
-        # Generate random RGB values
-        new_rgb = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+        # Extract position coordinates
+        x, y = position
         
-        # Modify the pixel at position (0,0)
-        pixels[0, 0] = new_rgb
+        # Generate random RGB values for entire block at once (vectorized)
+        random_block = np.random.randint(
+            0, 256, 
+            size=(block_size, block_size, 3), 
+            dtype=np.uint8
+        )
         
-        # Save the modified image
-        image.save(image_path)
+        # Apply the random block to image array using NumPy slicing (vectorized)
+        img_array[y:y+block_size, x:x+block_size] = random_block
         
+        # Convert back to PIL Image and save
+        Image.fromarray(img_array).save(image_path)
         return True
+        
     except Exception as e:
-        print(f"  - Error modifying pixel for {image_path}: {str(e)}")
+        print(f"Error modifying pixel block for {image_path}: {str(e)}")
         return False
 
 def modify_all_copied_images(upload_folder, copied_images):
     """
-    Modify the RGB value of pixel (0,0) for all copied images.
+    Modify a 4x4 pixel block for all copied images to ensure uniqueness.
     
     Args:
         upload_folder: Path to folder containing copied images
@@ -412,7 +422,7 @@ def modify_all_copied_images(upload_folder, copied_images):
         int: Number of successfully modified images
     """
     print("\n" + "=" * 50)
-    print("MODIFYING PIXEL RGB VALUES")
+    print("MODIFYING 4x4 PIXEL BLOCK FOR UNIQUENESS")
     print("=" * 50)
     
     modified_count = 0
@@ -421,7 +431,7 @@ def modify_all_copied_images(upload_folder, copied_images):
         image_path = os.path.join(upload_folder, filename)
         # print(f"Modifying pixel (0,0) for: {filename}")
         
-        if modify_pixel_rgb(image_path):
+        if modify_pixel_block(image_path, block_size=4):
             modified_count += 1
         #     print(f"  - Successfully modified")
         # else:
